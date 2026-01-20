@@ -17,6 +17,7 @@ from typing import Optional, Union
 import draccus
 import numpy as np
 import tqdm
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../../LIBERO'))
 from libero.libero import benchmark
 
 import wandb
