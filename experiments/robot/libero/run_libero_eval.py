@@ -16,7 +16,9 @@ from typing import Optional, Union
 
 import draccus
 import numpy as np
+import torch
 import tqdm
+from PIL import Image, ImageDraw, ImageFont
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../../LIBERO'))
 from libero.libero import benchmark
 
@@ -108,6 +110,27 @@ class GenerateConfig:
     load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
 
     #################################################################################################################
+    # Token selection & pruning (diffusion/regression inference)
+    #################################################################################################################
+    token_selection_enabled: bool = True             # Enable gradient-based token selection
+    token_prune_enabled: bool = False                # Enable LLM token pruning on non-eval frames
+    vision_partial_update_enabled: bool = False      # Enable partial vision token updates (cache reuse)
+    region_eval_interval: int = 1                    # Evaluate token importance every N frames
+    grad_denoise_steps: int = 1                      # Use last N denoise steps for gradient objective
+    grad_region_mass: float = 0.70                   # Mass threshold for region selection (normalized)
+    grad_region_ema: Optional[float] = 0.70          # EMA factor for region scores (None disables)
+    grad_keep_prev: bool = False                     # Union important mask with previous frame
+    grad_tau: float = 0.1                            # Gripper change scale for adaptive weighting
+    grad_alpha: float = 1.0                          # Gripper weight scale
+    grad_beta: float = 1.0                           # Position weight scale
+    token_temporal_threshold: float = 0.95           # Temporal cosine similarity threshold
+    token_spatial_threshold: float = 0.9             # Spatial cosine similarity threshold
+    token_spatial_radius: int = 1                    # Spatial neighbor radius (in tokens)
+    min_kept_tokens: int = 1                         # Minimum tokens to keep
+    max_kept_tokens: Optional[int] = None            # Maximum tokens to keep (None disables)
+    region_patch_size: int = 1                       # Region size in patch tokens
+
+    #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL  # Task suite
@@ -142,6 +165,15 @@ def validate_config(cfg: GenerateConfig) -> None:
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+
+    if cfg.token_selection_enabled:
+        assert (cfg.use_diffusion or cfg.use_l1_regression), (
+            "Token selection requires diffusion or L1 regression action prediction."
+        )
+        assert cfg.region_eval_interval >= 1, "region_eval_interval must be >= 1."
+        assert cfg.grad_denoise_steps >= 1, "grad_denoise_steps must be >= 1."
+        if cfg.max_kept_tokens is not None:
+            assert cfg.max_kept_tokens >= cfg.min_kept_tokens, "max_kept_tokens must be >= min_kept_tokens."
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -263,6 +295,107 @@ def prepare_observation(obs, resize_size):
     return observation, img  # Return both processed observation and original image for replay
 
 
+def _extract_overlay_state(model, cfg):
+    if not hasattr(model, "get_token_selection_state"):
+        return None, None
+
+    state = model.get_token_selection_state()
+    overlay_grid = state.get("last_overlay_grid")
+    if overlay_grid is None:
+        return None, None
+
+    if torch.is_tensor(overlay_grid):
+        overlay_grid = overlay_grid.detach().cpu().numpy()
+    overlay_grid = overlay_grid.astype(np.uint8)
+
+    if overlay_grid.ndim == 4:
+        overlay_grid = overlay_grid[0, 0]
+    elif overlay_grid.ndim == 3:
+        overlay_grid = overlay_grid[0]
+
+    region_scores = state.get("last_region_scores")
+    if region_scores is not None:
+        if torch.is_tensor(region_scores):
+            region_scores = region_scores.detach().cpu().numpy()
+        if region_scores.ndim == 4:
+            region_scores = region_scores[0, 0]
+        elif region_scores.ndim == 3:
+            region_scores = region_scores[0]
+    else:
+        token_scores = state.get("last_token_scores")
+        if token_scores is not None:
+            if torch.is_tensor(token_scores):
+                token_scores = token_scores.detach().cpu().numpy()
+            if token_scores.ndim == 2:
+                token_scores = token_scores[0]
+            tokens_per_image = overlay_grid.shape[0] * overlay_grid.shape[1]
+            token_scores = token_scores[:tokens_per_image]
+            token_scores = token_scores.reshape(overlay_grid.shape)
+            region_patch = max(1, int(cfg.region_patch_size))
+            if (
+                overlay_grid.shape[0] % region_patch == 0
+                and overlay_grid.shape[1] % region_patch == 0
+            ):
+                region_h = overlay_grid.shape[0] // region_patch
+                region_w = overlay_grid.shape[1] // region_patch
+                region_scores = token_scores.reshape(
+                    region_h, region_patch, region_w, region_patch
+                ).mean(axis=(1, 3))
+
+    return overlay_grid, region_scores
+
+
+def _apply_overlay(img, overlay_grid, region_scores=None, alpha=0.35):
+    if overlay_grid is None:
+        return img
+
+    img_np = img.astype(np.uint8, copy=False)
+    height, width = img_np.shape[:2]
+
+    overlay_img = Image.fromarray(overlay_grid).resize((width, height), resample=Image.NEAREST)
+    overlay_labels = np.array(overlay_img)
+
+    overlay_colors = np.zeros_like(img_np)
+    overlay_colors[overlay_labels == 0] = (0, 255, 0)
+    overlay_colors[overlay_labels == 1] = (255, 255, 0)
+    overlay_colors[overlay_labels == 2] = (255, 0, 0)
+    overlay_colors[overlay_labels == 3] = (0, 0, 255)
+
+    blended = (img_np.astype(np.float32) * (1.0 - alpha) + overlay_colors.astype(np.float32) * alpha).astype(
+        np.uint8
+    )
+
+    if region_scores is None:
+        return blended
+
+    if torch.is_tensor(region_scores):
+        region_scores = region_scores.detach().cpu().numpy()
+
+    region_scores = region_scores.astype(np.float32)
+    total = float(region_scores.sum())
+    if total > 0:
+        region_scores = region_scores / total
+
+    region_h, region_w = region_scores.shape
+    cell_w = width / max(region_w, 1)
+    cell_h = height / max(region_h, 1)
+
+    pil_img = Image.fromarray(blended)
+    draw = ImageDraw.Draw(pil_img)
+    font = ImageFont.load_default()
+
+    for r in range(region_h):
+        for c in range(region_w):
+            score = region_scores[r, c]
+            text = f"{score:.2f}"
+            x = int((c + 0.05) * cell_w)
+            y = int((r + 0.05) * cell_h)
+            draw.text((x + 1, y + 1), text, fill=(0, 0, 0), font=font)
+            draw.text((x, y), text, fill=(255, 255, 255), font=font)
+
+    return np.array(pil_img)
+
+
 def process_action(action, model_family):
     """Process action before sending to environment."""
     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
@@ -292,6 +425,8 @@ def run_episode(
     """Run a single episode in the environment."""
     # Reset environment
     env.reset()
+    if cfg.token_selection_enabled and hasattr(model, "reset_token_selection_state"):
+        model.reset_token_selection_state()
 
     # Set initial state if provided
     if initial_state is not None:
@@ -310,6 +445,8 @@ def run_episode(
     t = 0
     replay_images = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
+    last_overlay_grid = None
+    last_region_scores = None
 
     # Run episode
     success = False
@@ -323,7 +460,10 @@ def run_episode(
 
             # Prepare observation
             observation, img = prepare_observation(obs, resize_size)
-            replay_images.append(img)
+            if cfg.token_selection_enabled and last_overlay_grid is not None:
+                replay_images.append(_apply_overlay(img, last_overlay_grid, last_region_scores))
+            else:
+                replay_images.append(img)
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
@@ -340,6 +480,12 @@ def run_episode(
                     use_film=cfg.use_film,
                 )
                 action_queue.extend(actions)
+                if cfg.token_selection_enabled:
+                    overlay_grid, region_scores = _extract_overlay_state(model, cfg)
+                    if overlay_grid is not None:
+                        last_overlay_grid = overlay_grid
+                        last_region_scores = region_scores
+                        replay_images[-1] = _apply_overlay(img, last_overlay_grid, last_region_scores)
 
             # Get action from queue
             action = action_queue.popleft()

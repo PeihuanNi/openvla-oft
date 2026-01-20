@@ -1,5 +1,6 @@
 """Utils for evaluating robot policies in various environments."""
 
+import contextlib
 import os
 import random
 import time
@@ -127,7 +128,9 @@ def get_action(
     Raises:
         ValueError: If model family is not supported
     """
-    with torch.no_grad():
+    use_token_selection = bool(getattr(cfg, "token_selection_enabled", False))
+    grad_context = contextlib.nullcontext() if use_token_selection else torch.no_grad()
+    with grad_context:
         if cfg.model_family == "openvla":
             action = get_vla_action(
                 cfg=cfg,

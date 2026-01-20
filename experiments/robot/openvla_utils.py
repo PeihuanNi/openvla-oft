@@ -1,5 +1,6 @@
 """Utils for evaluating OpenVLA or fine-tuned OpenVLA policies."""
 
+import contextlib
 import filecmp
 import json
 import os
@@ -22,7 +23,7 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 json_numpy.patch()
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction, TokenSelectionConfig
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
@@ -250,6 +251,40 @@ def load_component_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
     return new_state_dict
 
 
+def _build_token_selection_cfg(cfg: Any) -> Optional[TokenSelectionConfig]:
+    """Build token selection config from eval settings, if present."""
+    if not hasattr(cfg, "token_selection_enabled"):
+        return None
+
+    max_kept_tokens = getattr(cfg, "max_kept_tokens", None)
+    if max_kept_tokens is not None and max_kept_tokens <= 0:
+        max_kept_tokens = None
+
+    grad_region_ema = getattr(cfg, "grad_region_ema", None)
+    if grad_region_ema is not None and grad_region_ema < 0:
+        grad_region_ema = None
+
+    return TokenSelectionConfig(
+        token_selection_enabled=bool(getattr(cfg, "token_selection_enabled", False)),
+        token_prune_enabled=bool(getattr(cfg, "token_prune_enabled", False)),
+        vision_partial_update_enabled=bool(getattr(cfg, "vision_partial_update_enabled", False)),
+        region_eval_interval=int(getattr(cfg, "region_eval_interval", 1)),
+        grad_denoise_steps=int(getattr(cfg, "grad_denoise_steps", 1)),
+        grad_region_mass=float(getattr(cfg, "grad_region_mass", 0.25)),
+        grad_region_ema=grad_region_ema,
+        grad_keep_prev=bool(getattr(cfg, "grad_keep_prev", False)),
+        grad_tau=float(getattr(cfg, "grad_tau", 0.1)),
+        grad_alpha=float(getattr(cfg, "grad_alpha", 1.0)),
+        grad_beta=float(getattr(cfg, "grad_beta", 1.0)),
+        token_temporal_threshold=float(getattr(cfg, "token_temporal_threshold", 0.9)),
+        token_spatial_threshold=float(getattr(cfg, "token_spatial_threshold", 0.9)),
+        token_spatial_radius=int(getattr(cfg, "token_spatial_radius", 1)),
+        min_kept_tokens=int(getattr(cfg, "min_kept_tokens", 1)),
+        max_kept_tokens=max_kept_tokens,
+        region_patch_size=int(getattr(cfg, "region_patch_size", 1)),
+    )
+
+
 def get_vla(cfg: Any) -> torch.nn.Module:
     """
     Load and initialize the VLA model from checkpoint.
@@ -304,6 +339,10 @@ def get_vla(cfg: Any) -> torch.nn.Module:
 
     # Load dataset stats for action normalization
     _load_dataset_stats(vla, cfg.pretrained_checkpoint)
+
+    token_cfg = _build_token_selection_cfg(cfg)
+    if token_cfg is not None and hasattr(vla, "configure_token_selection"):
+        vla.configure_token_selection(token_cfg)
 
     return vla
 
@@ -740,7 +779,9 @@ def get_vla_action(
     Returns:
         List[np.ndarray]: Predicted actions
     """
-    with torch.inference_mode():
+    use_token_selection = bool(getattr(cfg, "token_selection_enabled", False))
+    grad_context = contextlib.nullcontext() if use_token_selection else torch.inference_mode()
+    with grad_context:
 
         # Collect all input images
         all_images = [obs["full_image"]]

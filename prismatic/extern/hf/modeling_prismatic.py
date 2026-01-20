@@ -7,6 +7,7 @@ but exactly replicate the logic in `prismatic.models.vlms.prismatic.py`.
 """
 
 import logging
+import math
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
@@ -16,6 +17,7 @@ import timm
 import tokenizers
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformers
 from timm.models.vision_transformer import LayerScale
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
@@ -275,6 +277,29 @@ class PrismaticCausalLMOutputWithPast(ModelOutput):
 
     # Additions for VLMs
     projector_features: Optional[torch.FloatTensor] = None
+
+
+@dataclass
+class TokenSelectionConfig:
+    """Configuration for gradient-based token importance, selection, and pruning."""
+
+    token_selection_enabled: bool = False
+    token_prune_enabled: bool = False
+    vision_partial_update_enabled: bool = False
+    region_eval_interval: int = 1
+    grad_denoise_steps: int = 1
+    grad_region_mass: float = 0.25
+    grad_region_ema: Optional[float] = None
+    grad_keep_prev: bool = False
+    grad_tau: float = 0.1
+    grad_alpha: float = 1.0
+    grad_beta: float = 1.0
+    token_temporal_threshold: float = 0.9
+    token_spatial_threshold: float = 0.9
+    token_spatial_radius: int = 1
+    min_kept_tokens: int = 1
+    max_kept_tokens: Optional[int] = None
+    region_patch_size: int = 1
 
 
 class PrismaticPreTrainedModel(PreTrainedModel):
@@ -731,6 +756,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Compute vocab size for de-tokenization -- revert added "multiple of"
         self.vocab_size = self.config.text_config.vocab_size - self.config.pad_to_multiple_of
 
+        self._token_selection_cfg: Optional[TokenSelectionConfig] = None
+        self.reset_token_selection_state()
+
     def _prepare_input_for_action_prediction(self, input_ids, attention_mask):
         """Prepares input for action prediction by adding necessary tokens"""
         # Add (ACTION_DIM * NUM_ACTIONS_CHUNK) placeholder tokens to input_ids to simulate action tokens
@@ -790,6 +818,252 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         return actions
 
+    def configure_token_selection(self, cfg: Optional[TokenSelectionConfig]) -> None:
+        """Configure token selection and reset cached state."""
+        self._token_selection_cfg = cfg
+        self.reset_token_selection_state()
+
+    def reset_token_selection_state(self) -> None:
+        """Reset per-episode token selection state."""
+        self._token_selection_state: Dict[str, Any] = {
+            "frame_idx": 0,
+            "last_image_embs": None,
+            "last_important_mask": None,
+            "last_keep_mask": None,
+            "last_keep_pre_mask": None,
+            "last_clipped_mask": None,
+            "last_background_mask": None,
+            "last_token_scores": None,
+            "last_region_scores": None,
+            "last_overlay_labels": None,
+            "last_overlay_grid": None,
+            "last_effective_important_mask": None,
+            "last_eval_frame": False,
+            "last_gate": None,
+            "last_lambda_pos": None,
+            "last_lambda_grip": None,
+        }
+
+    def get_token_selection_state(self) -> Dict[str, Any]:
+        """Expose last token selection state for debugging/visualization."""
+        return self._token_selection_state
+
+    def _resolve_token_selection_cfg(self, cfg: Optional[TokenSelectionConfig]) -> Optional[TokenSelectionConfig]:
+        if cfg is not None:
+            return cfg
+        return self._token_selection_cfg
+
+    def _get_patch_grid_size(self, num_patches: Optional[int] = None) -> Tuple[int, int]:
+        num_patches = num_patches or self.vision_backbone.get_num_patches()
+        grid_size = int(math.sqrt(num_patches))
+        if grid_size * grid_size != num_patches:
+            raise ValueError(f"Expected square patch grid, got num_patches={num_patches}")
+        return grid_size, grid_size
+
+    def _reshape_tokens_to_grid(
+        self,
+        token_values: torch.Tensor,
+        num_images: int,
+        num_patches: int,
+        grid_h: int,
+        grid_w: int,
+    ) -> torch.Tensor:
+        if token_values.dim() == 1:
+            token_values = token_values.unsqueeze(0)
+        B = token_values.shape[0]
+        grids = []
+        for img_idx in range(num_images):
+            start = img_idx * num_patches
+            end = start + num_patches
+            grids.append(token_values[:, start:end].reshape(B, grid_h, grid_w))
+        return torch.stack(grids, dim=1)
+
+    def _compute_region_scores(
+        self,
+        token_scores: torch.Tensor,
+        region_patch_size: int,
+    ) -> torch.Tensor:
+        if token_scores.dim() == 1:
+            token_scores = token_scores.unsqueeze(0)
+        B, total_tokens = token_scores.shape
+        num_images = self.vision_backbone.get_num_images_in_input()
+        num_patches = self.vision_backbone.get_num_patches()
+        if total_tokens != num_images * num_patches:
+            raise ValueError("Token score shape does not match current vision token count.")
+        grid_h, grid_w = self._get_patch_grid_size(num_patches)
+        region_patch_size = max(1, int(region_patch_size))
+        if (grid_h % region_patch_size) != 0 or (grid_w % region_patch_size) != 0:
+            raise ValueError("region_patch_size must evenly divide patch grid dimensions.")
+        region_h = grid_h // region_patch_size
+        region_w = grid_w // region_patch_size
+
+        region_scores = torch.zeros(
+            (B, num_images, region_h, region_w), device=token_scores.device, dtype=token_scores.dtype
+        )
+        for img_idx in range(num_images):
+            start = img_idx * num_patches
+            end = start + num_patches
+            scores_img = token_scores[:, start:end].reshape(B, grid_h, grid_w)
+            if region_patch_size == 1:
+                region_scores[:, img_idx] = scores_img
+            else:
+                scores_regions = scores_img.reshape(B, region_h, region_patch_size, region_w, region_patch_size)
+                region_scores[:, img_idx] = scores_regions.mean(dim=(2, 4))
+
+        return region_scores
+
+    def _select_important_mask(
+        self,
+        region_scores: torch.Tensor,
+        grad_region_mass: float,
+        region_patch_size: int,
+    ) -> torch.Tensor:
+        B, num_images, region_h, region_w = region_scores.shape
+        num_patches = self.vision_backbone.get_num_patches()
+        total_tokens = num_patches * num_images
+        grid_h, grid_w = self._get_patch_grid_size(num_patches)
+        region_patch_size = max(1, int(region_patch_size))
+        important_mask = torch.zeros((B, total_tokens), device=region_scores.device, dtype=torch.bool)
+
+        for b in range(B):
+            for img_idx in range(num_images):
+                scores_flat = region_scores[b, img_idx].reshape(-1)
+                if scores_flat.numel() == 0:
+                    continue
+                total = scores_flat.sum()
+                if total <= 0:
+                    normalized = torch.full_like(scores_flat, 1.0 / scores_flat.numel())
+                else:
+                    normalized = scores_flat / total
+                sorted_scores, sorted_idx = torch.sort(normalized, descending=True)
+                keep_count = int((sorted_scores.cumsum(dim=0) < grad_region_mass).sum().item()) + 1
+                keep_count = min(max(keep_count, 1), sorted_scores.numel())
+                region_keep = torch.zeros_like(scores_flat, dtype=torch.bool)
+                region_keep[sorted_idx[:keep_count]] = True
+                region_keep_grid = region_keep.reshape(region_h, region_w)
+                token_mask_grid = region_keep_grid.repeat_interleave(region_patch_size, dim=0).repeat_interleave(
+                    region_patch_size, dim=1
+                )
+                token_mask_flat = token_mask_grid.reshape(-1)
+                start = img_idx * num_patches
+                important_mask[b, start : start + num_patches] = token_mask_flat
+
+        return important_mask
+
+    def _compute_background_mask(
+        self,
+        current_tokens: torch.Tensor,
+        last_tokens: Optional[torch.Tensor],
+        token_temporal_threshold: float,
+        token_spatial_threshold: float,
+        token_spatial_radius: int,
+    ) -> torch.Tensor:
+        if current_tokens.dim() == 2:
+            current_tokens = current_tokens.unsqueeze(0)
+        B, total_tokens, _ = current_tokens.shape
+        num_images = self.vision_backbone.get_num_images_in_input()
+        num_patches = self.vision_backbone.get_num_patches()
+        if total_tokens != num_images * num_patches:
+            raise ValueError("Token shape does not match current vision token count.")
+
+        temporal_mask = torch.zeros((B, total_tokens), device=current_tokens.device, dtype=torch.bool)
+        if last_tokens is not None and last_tokens.shape == current_tokens.shape:
+            temporal_sim = F.cosine_similarity(current_tokens, last_tokens, dim=-1)
+            temporal_mask = temporal_sim >= token_temporal_threshold
+
+        grid_h, grid_w = self._get_patch_grid_size(num_patches)
+        token_spatial_radius = max(0, int(token_spatial_radius))
+        spatial_mask = torch.zeros((B, total_tokens), device=current_tokens.device, dtype=torch.bool)
+        norm_tokens = F.normalize(current_tokens, dim=-1)
+
+        for img_idx in range(num_images):
+            start = img_idx * num_patches
+            end = start + num_patches
+            tokens_img = norm_tokens[:, start:end].reshape(B, grid_h, grid_w, -1)
+            for h in range(grid_h):
+                h0 = max(0, h - token_spatial_radius)
+                h1 = min(grid_h, h + token_spatial_radius + 1)
+                for w in range(grid_w):
+                    w0 = max(0, w - token_spatial_radius)
+                    w1 = min(grid_w, w + token_spatial_radius + 1)
+                    neighbors = tokens_img[:, h0:h1, w0:w1, :].reshape(B, -1, tokens_img.shape[-1])
+                    if neighbors.shape[1] == 1:
+                        spatial_sim = torch.ones(B, device=current_tokens.device, dtype=current_tokens.dtype)
+                    else:
+                        sim = (neighbors * tokens_img[:, h, w, :].unsqueeze(1)).sum(dim=-1)
+                        self_idx = (h - h0) * (w1 - w0) + (w - w0)
+                        sim = torch.cat([sim[:, :self_idx], sim[:, self_idx + 1 :]], dim=1)
+                        spatial_sim = sim.mean(dim=1)
+                    idx = start + h * grid_w + w
+                    spatial_mask[:, idx] = spatial_sim >= token_spatial_threshold
+
+        token_valid = torch.ones_like(spatial_mask, dtype=torch.bool)
+        return temporal_mask & spatial_mask & token_valid
+
+    def _apply_keep_constraints(
+        self,
+        keep_pre: torch.Tensor,
+        token_scores: torch.Tensor,
+        min_kept_tokens: int,
+        max_kept_tokens: Optional[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if keep_pre.dim() == 1:
+            keep_pre = keep_pre.unsqueeze(0)
+        if token_scores.dim() == 1:
+            token_scores = token_scores.unsqueeze(0)
+        B, total_tokens = keep_pre.shape
+        keep_final = keep_pre.clone()
+        clipped_mask = torch.zeros_like(keep_pre, dtype=torch.bool)
+
+        for b in range(B):
+            keep = keep_final[b].clone()
+            scores = token_scores[b]
+            min_kept = max(0, int(min_kept_tokens))
+            max_kept = total_tokens if max_kept_tokens is None else int(max_kept_tokens)
+            max_kept = max(1, max_kept) if max_kept > 0 else total_tokens
+            min_kept = min(min_kept, total_tokens)
+            max_kept = min(max_kept, total_tokens)
+            if min_kept > max_kept:
+                max_kept = min_kept
+
+            if keep.sum().item() < min_kept:
+                needed = min_kept - int(keep.sum().item())
+                scores_fill = scores.clone()
+                scores_fill[keep] = float("-inf")
+                _, add_idx = torch.topk(scores_fill, k=needed)
+                keep[add_idx] = True
+
+            if keep.sum().item() > max_kept:
+                scores_fill = scores.clone()
+                scores_fill[~keep] = float("-inf")
+                _, keep_idx = torch.topk(scores_fill, k=max_kept)
+                new_keep = torch.zeros_like(keep, dtype=torch.bool)
+                new_keep[keep_idx] = True
+                keep = new_keep
+
+            keep_final[b] = keep
+            clipped_mask[b] = keep_pre[b] & ~keep
+
+        return keep_final, clipped_mask
+
+    def _build_overlay_labels(
+        self,
+        keep_final: torch.Tensor,
+        important_mask: torch.Tensor,
+        clipped_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if keep_final.dim() == 1:
+            keep_final = keep_final.unsqueeze(0)
+        if important_mask.dim() == 1:
+            important_mask = important_mask.unsqueeze(0)
+        if clipped_mask.dim() == 1:
+            clipped_mask = clipped_mask.unsqueeze(0)
+        overlay = torch.zeros_like(keep_final, dtype=torch.uint8)
+        overlay[keep_final & ~important_mask] = 1
+        overlay[keep_final & important_mask] = 2
+        overlay[clipped_mask] = 3
+        return overlay
+
     def _run_diffusion_prediction(
         self,
         input_embeddings,
@@ -802,14 +1076,20 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES,
         NUM_PROMPT_TOKENS,
         noisy_action_projector,
+        collect_noise_preds: bool = False,
+        grad_denoise_steps: int = 0,
     ):
         """Run diffusion-based action prediction"""
         # Clone embedding for reuse in each timestep
         orig_projected_patch_embeddings = projected_patch_embeddings.clone()
         curr_noisy_actions = noise
+        noise_preds = []
+        timesteps = list(action_head.noise_scheduler.timesteps)
+        grad_denoise_steps = max(0, int(grad_denoise_steps))
+        collect_from = max(0, len(timesteps) - grad_denoise_steps)
 
         # Reverse diffusion: Iteratively denoise to generate action prediction
-        for t in action_head.noise_scheduler.timesteps:
+        for step_idx, t in enumerate(timesteps):
             # Get diffusion model's noise prediction (conditioned on VLA latent embedding, current noisy action
             # embedding, and diffusion timestep embedding)
             timesteps = torch.Tensor([t]).to(labels.device)
@@ -867,12 +1147,14 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
             # Predict noise and update noisy actions: x_t -> x_{t-1}
             noise_pred = action_head.predict_noise(actions_hidden_states)
+            if collect_noise_preds and step_idx >= collect_from:
+                noise_preds.append(noise_pred)
             curr_noisy_actions = action_head.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
 
         curr_noisy_actions = curr_noisy_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
 
         # Return final actions
-        return curr_noisy_actions.float().cpu().detach().numpy(), actions_hidden_states
+        return curr_noisy_actions.float().cpu().detach().numpy(), actions_hidden_states.detach(), noise_preds
 
     def _regression_or_discrete_prediction(
         self,
@@ -884,6 +1166,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES,
         NUM_PROMPT_TOKENS,
         action_head=None,
+        return_actions_tensor: bool = False,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
@@ -918,10 +1201,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         ]  # (B, act_chunk_len, D)
 
         # Handle different prediction methods
+        normalized_actions_tensor = None
         if action_head is not None:
             # L1 regression prediction
-            normalized_actions = action_head.predict_action(actions_hidden_states)
-            normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+            normalized_actions_tensor = action_head.predict_action(actions_hidden_states)
+            normalized_actions = normalized_actions_tensor.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
         else:
             # Discrete token-based prediction
@@ -939,7 +1223,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             normalized_actions = self.bin_centers[discretized_actions]
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
 
-        return normalized_actions, actions_hidden_states
+        if not return_actions_tensor:
+            normalized_actions_tensor = None
+
+        return normalized_actions, actions_hidden_states, normalized_actions_tensor
 
     def predict_action(
         self,
@@ -950,6 +1237,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_head=None,
         noisy_action_projector=None,
         use_film: bool = False,
+        token_selection_cfg: Optional[TokenSelectionConfig] = None,
+        return_token_selection: bool = False,
         **kwargs: str,
     ) -> np.ndarray:
         """Predict actions from input sequence, with options for different prediction methods.
@@ -962,10 +1251,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             action_head: Optional head for L1 regression or diffusion-based prediction
             noisy_action_projector: Projector for noisy actions in diffusion-based prediction
             use_film: Whether to use FiLM conditioning
+            token_selection_cfg: Optional token selection configuration
+            return_token_selection: If True, returns token selection state as well
             **kwargs: Additional arguments including pixel_values and attention_mask
 
         Returns:
-            Tuple of (unnormalized_actions, action_hidden_states)
+            Tuple of (unnormalized_actions, action_hidden_states) with optional token selection state
         """
         # If the special empty token ('') does not already appear after the colon (':') token in the prompt
         # (after "OUT:" or "ASSISTANT:"), insert it to match the inputs seen at training time
@@ -984,77 +1275,347 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Get number of tokens in prompt (excluding the start token)
         NUM_PROMPT_TOKENS = input_ids.shape[-1] - 1  # Subtract action tokens and stop token
 
-        # Prepare inputs by adding necessary tokens
-        input_ids, attention_mask = self._prepare_input_for_action_prediction(input_ids, attention_mask)
-
-        # Update labels tensor for action mask computation later
-        labels = self._prepare_labels_for_action_prediction(labels, input_ids)
-
-        # Get input embeddings and action masks
-        input_embeddings = self.get_input_embeddings()(input_ids)
-        all_actions_mask = self._process_action_masks(labels)
-
-        # Extract language embeddings
-        language_embeddings = input_embeddings[~all_actions_mask].reshape(
-            input_embeddings.shape[0], -1, input_embeddings.shape[2]
-        )
-
-        # Process vision features
-        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
-
-        # Add proprioceptive features if provided
-        use_proprio = proprio_projector is not None and proprio is not None
-        if use_proprio:
-            proprio = torch.Tensor(proprio).to(projected_patch_embeddings.device, dtype=projected_patch_embeddings.dtype)
-            projected_patch_embeddings = self._process_proprio_features(
-                projected_patch_embeddings, proprio, proprio_projector
-            )
-
         # Use diffusion if provided, otherwise use regression or discrete prediction
         use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")
+        use_regression = action_head is not None and hasattr(action_head, "predict_action") and not use_diffusion
 
-        # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
-        NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
-        if use_proprio:
-            NUM_PATCHES += 1
-        if use_diffusion:
-            NUM_PATCHES += 1
-
-        if use_diffusion:
-            # Sample random noise with shape equal to output action, used as the starting state for reverse diffusion
-            noise = torch.randn(
-                size=(1, NUM_ACTIONS_CHUNK, ACTION_DIM), device=input_embeddings.device, dtype=input_embeddings.dtype
+        token_cfg = self._resolve_token_selection_cfg(token_selection_cfg)
+        token_selection_active = (
+            token_cfg is not None
+            and token_cfg.token_selection_enabled
+            and (use_diffusion or use_regression)
+        )
+        if token_cfg is not None and token_cfg.token_selection_enabled and not (use_diffusion or use_regression):
+            logger.warning(
+                "Token selection is enabled but neither diffusion nor regression is active; skipping token selection."
             )
 
-            # Run diffusion-based prediction
-            normalized_actions, actions_hidden_states = self._run_diffusion_prediction(
-                input_embeddings,
-                all_actions_mask,
-                noise,
-                action_head,
-                projected_patch_embeddings,
-                labels,
-                attention_mask,
-                NUM_PATCHES,
-                NUM_PROMPT_TOKENS,
-                noisy_action_projector,
-            )
-        else:
-            # Run regression or discrete token-based prediction
-            normalized_actions, actions_hidden_states = self._regression_or_discrete_prediction(
-                input_embeddings,
-                all_actions_mask,
-                projected_patch_embeddings,
-                attention_mask,
-                labels,
-                NUM_PATCHES,
-                NUM_PROMPT_TOKENS,
-                action_head,
+        if not token_selection_active:
+            # Prepare inputs by adding necessary tokens
+            input_ids, attention_mask = self._prepare_input_for_action_prediction(input_ids, attention_mask)
+
+            # Update labels tensor for action mask computation later
+            labels = self._prepare_labels_for_action_prediction(labels, input_ids)
+
+            # Get input embeddings and action masks
+            input_embeddings = self.get_input_embeddings()(input_ids)
+            all_actions_mask = self._process_action_masks(labels)
+
+            # Extract language embeddings
+            language_embeddings = input_embeddings[~all_actions_mask].reshape(
+                input_embeddings.shape[0], -1, input_embeddings.shape[2]
             )
 
-        # Unnormalize predicted actions
+            # Process vision features
+            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+
+            # Add proprioceptive features if provided
+            use_proprio = proprio_projector is not None and proprio is not None
+            if use_proprio:
+                proprio = torch.Tensor(proprio).to(
+                    projected_patch_embeddings.device, dtype=projected_patch_embeddings.dtype
+                )
+                projected_patch_embeddings = self._process_proprio_features(
+                    projected_patch_embeddings, proprio, proprio_projector
+                )
+
+            # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
+            NUM_PATCHES = projected_patch_embeddings.shape[1]
+            if use_diffusion:
+                NUM_PATCHES += 1
+
+            if use_diffusion:
+                noise = torch.randn(
+                    size=(1, NUM_ACTIONS_CHUNK, ACTION_DIM),
+                    device=input_embeddings.device,
+                    dtype=input_embeddings.dtype,
+                )
+                normalized_actions, actions_hidden_states, _ = self._run_diffusion_prediction(
+                    input_embeddings,
+                    all_actions_mask,
+                    noise,
+                    action_head,
+                    projected_patch_embeddings,
+                    labels,
+                    attention_mask,
+                    NUM_PATCHES,
+                    NUM_PROMPT_TOKENS,
+                    noisy_action_projector,
+                )
+            else:
+                normalized_actions, actions_hidden_states, _ = self._regression_or_discrete_prediction(
+                    input_embeddings,
+                    all_actions_mask,
+                    projected_patch_embeddings,
+                    attention_mask,
+                    labels,
+                    NUM_PATCHES,
+                    NUM_PROMPT_TOKENS,
+                    action_head,
+                )
+
+            actions = self._unnormalize_actions(normalized_actions, unnorm_key)
+            if return_token_selection:
+                return actions, actions_hidden_states, None
+            return actions, actions_hidden_states
+
+        state = self._token_selection_state
+        interval = max(1, int(token_cfg.region_eval_interval))
+        eval_frame = (state["frame_idx"] % interval) == 0
+        state["frame_idx"] += 1
+        state["last_eval_frame"] = eval_frame
+
+        with torch.set_grad_enabled(eval_frame):
+            # Prepare inputs by adding necessary tokens
+            input_ids, attention_mask = self._prepare_input_for_action_prediction(input_ids, attention_mask)
+
+            # Update labels tensor for action mask computation later
+            labels = self._prepare_labels_for_action_prediction(labels, input_ids)
+
+            # Get input embeddings and action masks
+            input_embeddings = self.get_input_embeddings()(input_ids)
+            all_actions_mask = self._process_action_masks(labels)
+
+            # Extract language embeddings
+            language_embeddings = input_embeddings[~all_actions_mask].reshape(
+                input_embeddings.shape[0], -1, input_embeddings.shape[2]
+            )
+
+            # Process vision features
+            image_embs_new = self._process_vision_features(pixel_values, language_embeddings, use_film)
+            image_embs = image_embs_new
+            if (
+                token_cfg.vision_partial_update_enabled
+                and not eval_frame
+                and state["last_image_embs"] is not None
+            ):
+                update_mask = state["last_effective_important_mask"]
+                if update_mask is None:
+                    update_mask = state["last_important_mask"]
+                if update_mask is None:
+                    update_mask = torch.ones(
+                        image_embs_new.shape[:2], device=image_embs_new.device, dtype=torch.bool
+                    )
+                if update_mask.dim() == 1:
+                    update_mask = update_mask.unsqueeze(0)
+                image_embs = torch.where(update_mask.unsqueeze(-1), image_embs_new, state["last_image_embs"])
+
+            if eval_frame:
+                image_embs.requires_grad_(True)
+
+            background_mask = self._compute_background_mask(
+                image_embs.detach(),
+                state["last_image_embs"],
+                token_cfg.token_temporal_threshold,
+                token_cfg.token_spatial_threshold,
+                token_cfg.token_spatial_radius,
+            )
+
+            if not eval_frame:
+                important_mask = state["last_important_mask"]
+                if important_mask is None:
+                    important_mask = torch.zeros_like(background_mask, dtype=torch.bool)
+                token_scores = state["last_token_scores"]
+                if token_scores is None:
+                    token_scores = torch.linalg.norm(image_embs.detach(), dim=-1)
+                    state["last_token_scores"] = token_scores.detach()
+
+                keep_pre = (~background_mask) | important_mask
+                keep_final, clipped_mask = self._apply_keep_constraints(
+                    keep_pre,
+                    token_scores,
+                    token_cfg.min_kept_tokens,
+                    token_cfg.max_kept_tokens,
+                )
+                effective_important_mask = important_mask & keep_final
+                overlay = self._build_overlay_labels(keep_final, important_mask, clipped_mask)
+
+                if token_cfg.token_prune_enabled:
+                    if image_embs.shape[0] != 1:
+                        raise ValueError("Token pruning only supports batch size 1.")
+                    kept_indices = torch.where(keep_final[0])[0]
+                    image_embs_for_llm = image_embs[:, kept_indices, :]
+                else:
+                    image_embs_for_llm = image_embs
+
+                use_proprio = proprio_projector is not None and proprio is not None
+                if use_proprio:
+                    proprio = torch.Tensor(proprio).to(
+                        image_embs_for_llm.device, dtype=image_embs_for_llm.dtype
+                    )
+                    projected_patch_embeddings = self._process_proprio_features(
+                        image_embs_for_llm, proprio, proprio_projector
+                    )
+                else:
+                    projected_patch_embeddings = image_embs_for_llm
+
+                if use_diffusion:
+                    NUM_PATCHES = projected_patch_embeddings.shape[1] + 1
+                    noise = torch.randn(
+                        size=(1, NUM_ACTIONS_CHUNK, ACTION_DIM),
+                        device=input_embeddings.device,
+                        dtype=input_embeddings.dtype,
+                    )
+                    normalized_actions, actions_hidden_states, _ = self._run_diffusion_prediction(
+                        input_embeddings,
+                        all_actions_mask,
+                        noise,
+                        action_head,
+                        projected_patch_embeddings,
+                        labels,
+                        attention_mask,
+                        NUM_PATCHES,
+                        NUM_PROMPT_TOKENS,
+                        noisy_action_projector,
+                    )
+                else:
+                    NUM_PATCHES = projected_patch_embeddings.shape[1]
+                    normalized_actions, actions_hidden_states, _ = self._regression_or_discrete_prediction(
+                        input_embeddings,
+                        all_actions_mask,
+                        projected_patch_embeddings,
+                        attention_mask,
+                        labels,
+                        NUM_PATCHES,
+                        NUM_PROMPT_TOKENS,
+                        action_head,
+                    )
+
+            else:
+                use_proprio = proprio_projector is not None and proprio is not None
+                if use_proprio:
+                    proprio = torch.Tensor(proprio).to(image_embs.device, dtype=image_embs.dtype)
+                    projected_patch_embeddings = self._process_proprio_features(
+                        image_embs, proprio, proprio_projector
+                    )
+                else:
+                    projected_patch_embeddings = image_embs
+
+                normalized_actions_tensor = None
+                noise_preds = None
+                if use_diffusion:
+                    NUM_PATCHES = projected_patch_embeddings.shape[1] + 1
+                    noise = torch.randn(
+                        size=(1, NUM_ACTIONS_CHUNK, ACTION_DIM),
+                        device=input_embeddings.device,
+                        dtype=input_embeddings.dtype,
+                    )
+                    normalized_actions, actions_hidden_states, noise_preds = self._run_diffusion_prediction(
+                        input_embeddings,
+                        all_actions_mask,
+                        noise,
+                        action_head,
+                        projected_patch_embeddings,
+                        labels,
+                        attention_mask,
+                        NUM_PATCHES,
+                        NUM_PROMPT_TOKENS,
+                        noisy_action_projector,
+                        collect_noise_preds=True,
+                        grad_denoise_steps=token_cfg.grad_denoise_steps,
+                    )
+                else:
+                    NUM_PATCHES = projected_patch_embeddings.shape[1]
+                    normalized_actions, actions_hidden_states, normalized_actions_tensor = (
+                        self._regression_or_discrete_prediction(
+                            input_embeddings,
+                            all_actions_mask,
+                            projected_patch_embeddings,
+                            attention_mask,
+                            labels,
+                            NUM_PATCHES,
+                            NUM_PROMPT_TOKENS,
+                            action_head,
+                            return_actions_tensor=True,
+                        )
+                    )
+                    if normalized_actions_tensor is None:
+                        raise ValueError("Token selection requires regression action head when diffusion is disabled.")
+
+                gate = 0.0
+                if token_cfg.grad_tau > 0:
+                    gripper = normalized_actions[:, -1]
+                    if gripper.shape[0] > 1:
+                        m = float(np.mean(np.abs(gripper[1:] - gripper[:-1])))
+                    else:
+                        m = 0.0
+                    gate = float(np.clip(m / token_cfg.grad_tau, 0.0, 1.0))
+                lambda_grip = 1.0 + token_cfg.grad_alpha * gate
+                lambda_pos = 1.0 + token_cfg.grad_beta * (1.0 - gate)
+
+                objective = torch.zeros((), device=image_embs.device, dtype=image_embs.dtype)
+                if use_diffusion:
+                    for noise_pred in noise_preds:
+                        v_pos = noise_pred[..., :-1]
+                        v_grip = noise_pred[..., -1]
+                        objective = objective + lambda_pos * (v_pos.pow(2).sum()) + lambda_grip * (v_grip.pow(2).sum())
+                else:
+                    v_pos = normalized_actions_tensor[..., :-1]
+                    v_grip = normalized_actions_tensor[..., -1]
+                    objective = objective + lambda_pos * (v_pos.pow(2).sum()) + lambda_grip * (v_grip.pow(2).sum())
+
+                image_grads = torch.autograd.grad(
+                    objective,
+                    image_embs,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=True,
+                )[0]
+                if image_grads is None:
+                    image_grads = torch.zeros_like(image_embs)
+
+                token_scores = torch.linalg.norm(image_grads, dim=-1) * torch.linalg.norm(
+                    image_embs.detach(), dim=-1
+                )
+                token_scores = token_scores.detach()
+
+                region_scores = self._compute_region_scores(token_scores, token_cfg.region_patch_size)
+                if token_cfg.grad_region_ema is not None and state["last_region_scores"] is not None:
+                    if state["last_region_scores"].shape == region_scores.shape:
+                        region_scores = token_cfg.grad_region_ema * state["last_region_scores"] + (
+                            1.0 - token_cfg.grad_region_ema
+                        ) * region_scores
+
+                mass = float(min(max(token_cfg.grad_region_mass, 0.0), 1.0))
+                important_mask = self._select_important_mask(region_scores, mass, token_cfg.region_patch_size)
+                if token_cfg.grad_keep_prev and state["last_important_mask"] is not None:
+                    important_mask = important_mask | state["last_important_mask"]
+
+                keep_pre = (~background_mask) | important_mask
+                keep_final, clipped_mask = self._apply_keep_constraints(
+                    keep_pre,
+                    token_scores,
+                    token_cfg.min_kept_tokens,
+                    token_cfg.max_kept_tokens,
+                )
+                effective_important_mask = important_mask & keep_final
+                overlay = self._build_overlay_labels(keep_final, important_mask, clipped_mask)
+
+                state["last_token_scores"] = token_scores.detach()
+                state["last_region_scores"] = region_scores.detach()
+                state["last_important_mask"] = important_mask.detach()
+                state["last_gate"] = gate
+                state["last_lambda_pos"] = lambda_pos
+                state["last_lambda_grip"] = lambda_grip
+
+            state["last_image_embs"] = image_embs.detach()
+            state["last_background_mask"] = background_mask.detach()
+            state["last_keep_pre_mask"] = keep_pre.detach()
+            state["last_keep_mask"] = keep_final.detach()
+            state["last_clipped_mask"] = clipped_mask.detach()
+            state["last_effective_important_mask"] = effective_important_mask.detach()
+            state["last_overlay_labels"] = overlay.detach()
+
+            num_images = self.vision_backbone.get_num_images_in_input()
+            num_patches = self.vision_backbone.get_num_patches()
+            grid_h, grid_w = self._get_patch_grid_size(num_patches)
+            state["last_overlay_grid"] = self._reshape_tokens_to_grid(
+                overlay.detach(), num_images, num_patches, grid_h, grid_w
+            )
+
         actions = self._unnormalize_actions(normalized_actions, unnorm_key)
-
+        if return_token_selection:
+            return actions, actions_hidden_states, state
         return actions, actions_hidden_states
 
     @staticmethod

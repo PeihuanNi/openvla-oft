@@ -1,1 +1,0 @@
-MUJOCO_GL="osmesa" PYOPENGL_PLATFORM="osmesa" CUDA_VISIBLE_DEVICES=0 python experiments/robot/libero/run_libero_eval.py   --pretrained_checkpoint /home/nipeihuan/models/openvla-7b-oft-finetuned-libero-spatial-object-goal-10   --task_suite_name libero_spatial
