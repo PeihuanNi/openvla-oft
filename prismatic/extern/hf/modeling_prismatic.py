@@ -8,6 +8,7 @@ but exactly replicate the logic in `prismatic.models.vlms.prismatic.py`.
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
@@ -839,6 +840,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             "last_overlay_grid": None,
             "last_effective_important_mask": None,
             "last_eval_frame": False,
+            "last_timing": None,
             "last_gate": None,
             "last_lambda_pos": None,
             "last_lambda_grip": None,
@@ -960,6 +962,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
     ) -> torch.Tensor:
         if current_tokens.dim() == 2:
             current_tokens = current_tokens.unsqueeze(0)
+        # Avoid unsupported bf16 ops in similarity math.
+        current_tokens_f = current_tokens.float()
+        last_tokens_f = None if last_tokens is None else last_tokens.float()
         B, total_tokens, _ = current_tokens.shape
         num_images = self.vision_backbone.get_num_images_in_input()
         num_patches = self.vision_backbone.get_num_patches()
@@ -967,14 +972,14 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             raise ValueError("Token shape does not match current vision token count.")
 
         temporal_mask = torch.zeros((B, total_tokens), device=current_tokens.device, dtype=torch.bool)
-        if last_tokens is not None and last_tokens.shape == current_tokens.shape:
-            temporal_sim = F.cosine_similarity(current_tokens, last_tokens, dim=-1)
+        if last_tokens_f is not None and last_tokens_f.shape == current_tokens_f.shape:
+            temporal_sim = F.cosine_similarity(current_tokens_f, last_tokens_f, dim=-1)
             temporal_mask = temporal_sim >= token_temporal_threshold
 
         grid_h, grid_w = self._get_patch_grid_size(num_patches)
         token_spatial_radius = max(0, int(token_spatial_radius))
         spatial_mask = torch.zeros((B, total_tokens), device=current_tokens.device, dtype=torch.bool)
-        norm_tokens = F.normalize(current_tokens, dim=-1)
+        norm_tokens = F.normalize(current_tokens_f, dim=-1)
 
         for img_idx in range(num_images):
             start = img_idx * num_patches
@@ -1015,31 +1020,77 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         keep_final = keep_pre.clone()
         clipped_mask = torch.zeros_like(keep_pre, dtype=torch.bool)
 
+        num_images = self.vision_backbone.get_num_images_in_input()
+        num_patches = self.vision_backbone.get_num_patches()
+        expected_tokens = num_images * num_patches
+        per_image_min = None
+        per_image_max = None
+        if total_tokens == expected_tokens:
+            per_image_min = max(0, int(min_kept_tokens))
+            per_image_min = min(per_image_min, num_patches)
+            if max_kept_tokens is not None:
+                per_image_max = int(max_kept_tokens)
+                if per_image_max <= 0:
+                    per_image_max = num_patches
+                else:
+                    per_image_max = min(per_image_max, num_patches)
+                if per_image_max < per_image_min:
+                    per_image_max = per_image_min
+        use_per_image = total_tokens == expected_tokens and (
+            (per_image_min is not None and per_image_min > 0) or per_image_max is not None
+        )
+
         for b in range(B):
             keep = keep_final[b].clone()
             scores = token_scores[b]
             min_kept = max(0, int(min_kept_tokens))
-            max_kept = total_tokens if max_kept_tokens is None else int(max_kept_tokens)
-            max_kept = max(1, max_kept) if max_kept > 0 else total_tokens
             min_kept = min(min_kept, total_tokens)
-            max_kept = min(max_kept, total_tokens)
-            if min_kept > max_kept:
-                max_kept = min_kept
 
-            if keep.sum().item() < min_kept:
-                needed = min_kept - int(keep.sum().item())
-                scores_fill = scores.clone()
-                scores_fill[keep] = float("-inf")
-                _, add_idx = torch.topk(scores_fill, k=needed)
-                keep[add_idx] = True
+            if not use_per_image:
+                max_kept = total_tokens if max_kept_tokens is None else int(max_kept_tokens)
+                max_kept = max(1, max_kept) if max_kept > 0 else total_tokens
+                max_kept = min(max_kept, total_tokens)
+                if min_kept > max_kept:
+                    max_kept = min_kept
 
-            if keep.sum().item() > max_kept:
-                scores_fill = scores.clone()
-                scores_fill[~keep] = float("-inf")
-                _, keep_idx = torch.topk(scores_fill, k=max_kept)
-                new_keep = torch.zeros_like(keep, dtype=torch.bool)
-                new_keep[keep_idx] = True
-                keep = new_keep
+                if keep.sum().item() < min_kept:
+                    needed = min_kept - int(keep.sum().item())
+                    scores_fill = scores.clone()
+                    scores_fill[keep] = float("-inf")
+                    _, add_idx = torch.topk(scores_fill, k=needed)
+                    keep[add_idx] = True
+
+                if keep.sum().item() > max_kept:
+                    scores_fill = scores.clone()
+                    scores_fill[~keep] = float("-inf")
+                    _, keep_idx = torch.topk(scores_fill, k=max_kept)
+                    new_keep = torch.zeros_like(keep, dtype=torch.bool)
+                    new_keep[keep_idx] = True
+                    keep = new_keep
+
+                keep_final[b] = keep
+                clipped_mask[b] = keep_pre[b] & ~keep
+                continue
+
+            for img_idx in range(num_images):
+                start = img_idx * num_patches
+                end = start + num_patches
+                keep_img = keep[start:end]
+                if per_image_min is not None and keep_img.sum().item() < per_image_min:
+                    needed = per_image_min - int(keep_img.sum().item())
+                    scores_img = scores[start:end]
+                    scores_fill = scores_img.clone()
+                    scores_fill[keep_img] = float("-inf")
+                    _, add_idx = torch.topk(scores_fill, k=needed)
+                    keep_img[add_idx] = True
+                if per_image_max is not None and keep_img.sum().item() > per_image_max:
+                    scores_img = scores[start:end]
+                    scores_fill = scores_img.clone()
+                    scores_fill[~keep_img] = float("-inf")
+                    _, keep_idx = torch.topk(scores_fill, k=per_image_max)
+                    new_keep_img = torch.zeros_like(keep_img, dtype=torch.bool)
+                    new_keep_img[keep_idx] = True
+                    keep[start:end] = new_keep_img
 
             keep_final[b] = keep
             clipped_mask[b] = keep_pre[b] & ~keep
@@ -1078,6 +1129,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         noisy_action_projector,
         collect_noise_preds: bool = False,
         grad_denoise_steps: int = 0,
+        timing: Optional[Dict[str, float]] = None,
+        timer_device: Optional[torch.device] = None,
     ):
         """Run diffusion-based action prediction"""
         # Clone embedding for reuse in each timestep
@@ -1124,6 +1177,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
 
             # Forward pass through language model
+            if timing is not None:
+                if timer_device is None:
+                    timer_device = input_embeddings.device
+                if timer_device.type == "cuda":
+                    torch.cuda.synchronize(timer_device)
+                lm_start = time.perf_counter()
             language_model_output = self.language_model(
                 input_ids=None,
                 attention_mask=multimodal_attention_mask,
@@ -1136,6 +1195,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 output_hidden_states=True,
                 return_dict=True,
             )
+            if timing is not None:
+                if timer_device.type == "cuda":
+                    torch.cuda.synchronize(timer_device)
+                timing["language"] = timing.get("language", 0.0) + (time.perf_counter() - lm_start)
 
             # Extract hidden states for action portion of response
             last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
@@ -1146,7 +1209,17 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             ]  # (B, act_chunk_len, D)
 
             # Predict noise and update noisy actions: x_t -> x_{t-1}
+            if timing is not None:
+                if timer_device is None:
+                    timer_device = input_embeddings.device
+                if timer_device.type == "cuda":
+                    torch.cuda.synchronize(timer_device)
+                head_start = time.perf_counter()
             noise_pred = action_head.predict_noise(actions_hidden_states)
+            if timing is not None:
+                if timer_device.type == "cuda":
+                    torch.cuda.synchronize(timer_device)
+                timing["action"] = timing.get("action", 0.0) + (time.perf_counter() - head_start)
             if collect_noise_preds and step_idx >= collect_from:
                 noise_preds.append(noise_pred)
             curr_noisy_actions = action_head.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
@@ -1167,6 +1240,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PROMPT_TOKENS,
         action_head=None,
         return_actions_tensor: bool = False,
+        timing: Optional[Dict[str, float]] = None,
+        timer_device: Optional[torch.device] = None,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
@@ -1179,6 +1254,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Forward pass through language model
+        if timing is not None:
+            if timer_device is None:
+                timer_device = input_embeddings.device
+            if timer_device.type == "cuda":
+                torch.cuda.synchronize(timer_device)
+            lm_start = time.perf_counter()
         language_model_output = self.language_model(
             input_ids=None,
             attention_mask=multimodal_attention_mask,
@@ -1191,6 +1272,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             output_hidden_states=True,
             return_dict=True,
         )
+        if timing is not None:
+            if timer_device.type == "cuda":
+                torch.cuda.synchronize(timer_device)
+            timing["language"] = timing.get("language", 0.0) + (time.perf_counter() - lm_start)
 
         # Extract hidden states for action tokens
         last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
@@ -1204,7 +1289,17 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         normalized_actions_tensor = None
         if action_head is not None:
             # L1 regression prediction
+            if timing is not None:
+                if timer_device is None:
+                    timer_device = input_embeddings.device
+                if timer_device.type == "cuda":
+                    torch.cuda.synchronize(timer_device)
+                head_start = time.perf_counter()
             normalized_actions_tensor = action_head.predict_action(actions_hidden_states)
+            if timing is not None:
+                if timer_device.type == "cuda":
+                    torch.cuda.synchronize(timer_device)
+                timing["action"] = timing.get("action", 0.0) + (time.perf_counter() - head_start)
             normalized_actions = normalized_actions_tensor.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
         else:
@@ -1291,6 +1386,26 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
 
         if not token_selection_active:
+            timing: Dict[str, float] = {"vision": 0.0, "language": 0.0, "action": 0.0}
+            timer_device: Optional[torch.device] = None
+            if torch.is_tensor(pixel_values):
+                timer_device = pixel_values.device
+            elif isinstance(pixel_values, dict):
+                for value in pixel_values.values():
+                    if torch.is_tensor(value):
+                        timer_device = value.device
+                        break
+
+            def _timing_start():
+                if timer_device is not None and timer_device.type == "cuda":
+                    torch.cuda.synchronize(timer_device)
+                return time.perf_counter()
+
+            def _timing_stop(start: float) -> float:
+                if timer_device is not None and timer_device.type == "cuda":
+                    torch.cuda.synchronize(timer_device)
+                return time.perf_counter() - start
+
             # Prepare inputs by adding necessary tokens
             input_ids, attention_mask = self._prepare_input_for_action_prediction(input_ids, attention_mask)
 
@@ -1307,7 +1422,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
 
             # Process vision features
+            vision_start = _timing_start()
             projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+            timing["vision"] = timing.get("vision", 0.0) + _timing_stop(vision_start)
 
             # Add proprioceptive features if provided
             use_proprio = proprio_projector is not None and proprio is not None
@@ -1341,6 +1458,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     NUM_PATCHES,
                     NUM_PROMPT_TOKENS,
                     noisy_action_projector,
+                    timing=timing,
+                    timer_device=timer_device,
                 )
             else:
                 normalized_actions, actions_hidden_states, _ = self._regression_or_discrete_prediction(
@@ -1352,14 +1471,36 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     NUM_PATCHES,
                     NUM_PROMPT_TOKENS,
                     action_head,
+                    timing=timing,
+                    timer_device=timer_device,
                 )
 
             actions = self._unnormalize_actions(normalized_actions, unnorm_key)
+            self._token_selection_state["last_timing"] = timing
             if return_token_selection:
                 return actions, actions_hidden_states, None
             return actions, actions_hidden_states
 
         state = self._token_selection_state
+        timing: Dict[str, float] = {"vision": 0.0, "language": 0.0, "action": 0.0, "eval": 0.0}
+        timer_device: Optional[torch.device] = None
+        if torch.is_tensor(pixel_values):
+            timer_device = pixel_values.device
+        elif isinstance(pixel_values, dict):
+            for value in pixel_values.values():
+                if torch.is_tensor(value):
+                    timer_device = value.device
+                    break
+
+        def _timing_start():
+            if timer_device is not None and timer_device.type == "cuda":
+                torch.cuda.synchronize(timer_device)
+            return time.perf_counter()
+
+        def _timing_stop(start: float) -> float:
+            if timer_device is not None and timer_device.type == "cuda":
+                torch.cuda.synchronize(timer_device)
+            return time.perf_counter() - start
         interval = max(1, int(token_cfg.region_eval_interval))
         eval_frame = (state["frame_idx"] % interval) == 0
         state["frame_idx"] += 1
@@ -1382,7 +1523,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
 
             # Process vision features
+            vision_start = _timing_start()
             image_embs_new = self._process_vision_features(pixel_values, language_embeddings, use_film)
+            timing["vision"] = timing.get("vision", 0.0) + _timing_stop(vision_start)
             image_embs = image_embs_new
             if (
                 token_cfg.vision_partial_update_enabled
@@ -1417,7 +1560,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     important_mask = torch.zeros_like(background_mask, dtype=torch.bool)
                 token_scores = state["last_token_scores"]
                 if token_scores is None:
-                    token_scores = torch.linalg.norm(image_embs.detach(), dim=-1)
+                    token_scores = torch.linalg.norm(image_embs.detach().float(), dim=-1)
                     state["last_token_scores"] = token_scores.detach()
 
                 keep_pre = (~background_mask) | important_mask
@@ -1467,6 +1610,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                         NUM_PATCHES,
                         NUM_PROMPT_TOKENS,
                         noisy_action_projector,
+                        timing=timing,
+                        timer_device=timer_device,
                     )
                 else:
                     NUM_PATCHES = projected_patch_embeddings.shape[1]
@@ -1479,6 +1624,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                         NUM_PATCHES,
                         NUM_PROMPT_TOKENS,
                         action_head,
+                        timing=timing,
+                        timer_device=timer_device,
                     )
 
             else:
@@ -1513,6 +1660,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                         noisy_action_projector,
                         collect_noise_preds=True,
                         grad_denoise_steps=token_cfg.grad_denoise_steps,
+                        timing=timing,
+                        timer_device=timer_device,
                     )
                 else:
                     NUM_PATCHES = projected_patch_embeddings.shape[1]
@@ -1527,11 +1676,14 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                             NUM_PROMPT_TOKENS,
                             action_head,
                             return_actions_tensor=True,
+                            timing=timing,
+                            timer_device=timer_device,
                         )
                     )
                     if normalized_actions_tensor is None:
                         raise ValueError("Token selection requires regression action head when diffusion is disabled.")
 
+                eval_start = _timing_start()
                 gate = 0.0
                 if token_cfg.grad_tau > 0:
                     gripper = normalized_actions[:, -1]
@@ -1564,9 +1716,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 if image_grads is None:
                     image_grads = torch.zeros_like(image_embs)
 
-                token_scores = torch.linalg.norm(image_grads, dim=-1) * torch.linalg.norm(
-                    image_embs.detach(), dim=-1
-                )
+                # Use float32 for norms to avoid unsupported bf16 linalg ops.
+                grad_norm = torch.linalg.norm(image_grads.float(), dim=-1)
+                token_norm = torch.linalg.norm(image_embs.detach().float(), dim=-1)
+                token_scores = grad_norm * token_norm
                 token_scores = token_scores.detach()
 
                 region_scores = self._compute_region_scores(token_scores, token_cfg.region_patch_size)
@@ -1590,6 +1743,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 )
                 effective_important_mask = important_mask & keep_final
                 overlay = self._build_overlay_labels(keep_final, important_mask, clipped_mask)
+                timing["eval"] = timing.get("eval", 0.0) + _timing_stop(eval_start)
 
                 state["last_token_scores"] = token_scores.detach()
                 state["last_region_scores"] = region_scores.detach()
@@ -1605,6 +1759,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             state["last_clipped_mask"] = clipped_mask.detach()
             state["last_effective_important_mask"] = effective_important_mask.detach()
             state["last_overlay_labels"] = overlay.detach()
+            state["last_timing"] = timing
 
             num_images = self.vision_backbone.get_num_images_in_input()
             num_patches = self.vision_backbone.get_num_patches()

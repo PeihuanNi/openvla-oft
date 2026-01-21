@@ -7,7 +7,9 @@ Evaluates a trained policy in a LIBERO simulation benchmark task suite.
 import json
 import logging
 import os
+import shlex
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -144,6 +146,7 @@ class GenerateConfig:
     #################################################################################################################
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
+    rollout_dir: str = "./rollouts"                  # Base directory for rollout MP4s
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
@@ -313,6 +316,17 @@ def _extract_overlay_state(model, cfg):
     elif overlay_grid.ndim == 3:
         overlay_grid = overlay_grid[0]
 
+    region_patch = max(1, int(cfg.region_patch_size))
+    token_scores = state.get("last_token_scores")
+    if token_scores is not None:
+        if torch.is_tensor(token_scores):
+            token_scores = token_scores.detach().cpu().numpy()
+        if token_scores.ndim == 2:
+            token_scores = token_scores[0]
+        tokens_per_image = overlay_grid.shape[0] * overlay_grid.shape[1]
+        token_scores = token_scores[:tokens_per_image]
+        token_scores = token_scores.reshape(overlay_grid.shape)
+
     region_scores = state.get("last_region_scores")
     if region_scores is not None:
         if torch.is_tensor(region_scores):
@@ -321,23 +335,35 @@ def _extract_overlay_state(model, cfg):
             region_scores = region_scores[0, 0]
         elif region_scores.ndim == 3:
             region_scores = region_scores[0]
-    else:
-        token_scores = state.get("last_token_scores")
-        if token_scores is not None:
-            if torch.is_tensor(token_scores):
-                token_scores = token_scores.detach().cpu().numpy()
-            if token_scores.ndim == 2:
-                token_scores = token_scores[0]
-            tokens_per_image = overlay_grid.shape[0] * overlay_grid.shape[1]
-            token_scores = token_scores[:tokens_per_image]
-            token_scores = token_scores.reshape(overlay_grid.shape)
-            region_patch = max(1, int(cfg.region_patch_size))
-            if (
-                overlay_grid.shape[0] % region_patch == 0
-                and overlay_grid.shape[1] % region_patch == 0
-            ):
-                region_h = overlay_grid.shape[0] // region_patch
-                region_w = overlay_grid.shape[1] // region_patch
+    elif token_scores is not None and region_patch > 1:
+        if (
+            overlay_grid.shape[0] % region_patch == 0
+            and overlay_grid.shape[1] % region_patch == 0
+        ):
+            region_h = overlay_grid.shape[0] // region_patch
+            region_w = overlay_grid.shape[1] // region_patch
+            region_scores = token_scores.reshape(
+                region_h, region_patch, region_w, region_patch
+            ).mean(axis=(1, 3))
+
+    if region_patch > 1:
+        if overlay_grid.shape[0] % region_patch == 0 and overlay_grid.shape[1] % region_patch == 0:
+            region_h = overlay_grid.shape[0] // region_patch
+            region_w = overlay_grid.shape[1] // region_patch
+            labels = overlay_grid.reshape(region_h, region_patch, region_w, region_patch)
+            if token_scores is not None:
+                scores = token_scores.reshape(region_h, region_patch, region_w, region_patch)
+                label_scores = np.zeros((4, region_h, region_w), dtype=np.float32)
+                for label in range(4):
+                    label_scores[label] = (scores * (labels == label)).sum(axis=(1, 3))
+                region_labels = label_scores.argmax(axis=0).astype(np.uint8)
+            else:
+                label_counts = np.zeros((4, region_h, region_w), dtype=np.int32)
+                for label in range(4):
+                    label_counts[label] = (labels == label).sum(axis=(1, 3))
+                region_labels = label_counts.argmax(axis=0).astype(np.uint8)
+            overlay_grid = region_labels
+            if region_scores is not None and region_scores.shape != overlay_grid.shape and token_scores is not None:
                 region_scores = token_scores.reshape(
                     region_h, region_patch, region_w, region_patch
                 ).mean(axis=(1, 3))
@@ -382,18 +408,211 @@ def _apply_overlay(img, overlay_grid, region_scores=None, alpha=0.35):
 
     pil_img = Image.fromarray(blended)
     draw = ImageDraw.Draw(pil_img)
-    font = ImageFont.load_default()
+    font_size = max(7, min(10, int(min(cell_w, cell_h) * 0.4)))
+    font = None
+    for font_name in ("DejaVuSansMono.ttf", "DejaVuSans.ttf", "Arial.ttf"):
+        try:
+            font = ImageFont.truetype(font_name, size=font_size)
+            break
+        except OSError:
+            font = None
+    if font is None:
+        font = ImageFont.load_default()
 
     for r in range(region_h):
         for c in range(region_w):
             score = region_scores[r, c]
-            text = f"{score:.2f}"
-            x = int((c + 0.05) * cell_w)
-            y = int((r + 0.05) * cell_h)
+            text = f"{score:.3f}"
+            x = int((c + 0.03) * cell_w)
+            y = int((r + 0.03) * cell_h)
             draw.text((x + 1, y + 1), text, fill=(0, 0, 0), font=font)
             draw.text((x, y), text, fill=(255, 255, 255), font=font)
 
     return np.array(pil_img)
+
+
+def _init_forward_stats():
+    return {
+        "total_calls": 0,
+        "total_time": 0.0,
+        "total_steps": 0,
+        "base": {"count": 0, "total": 0.0, "vision": 0.0, "language": 0.0, "action": 0.0},
+        "eval": {
+            "count": 0,
+            "total": 0.0,
+            "vision": 0.0,
+            "language": 0.0,
+            "action": 0.0,
+            "eval": 0.0,
+            "important_ratio": 0.0,
+            "ratio_count": 0,
+        },
+        "prune": {
+            "count": 0,
+            "total": 0.0,
+            "vision": 0.0,
+            "language": 0.0,
+            "action": 0.0,
+            "prune_ratio": 0.0,
+            "important_ratio": 0.0,
+            "background_ratio": 0.0,
+            "ratio_count": 0,
+        },
+    }
+
+
+def _mask_ratio(mask):
+    if mask is None:
+        return None
+    if torch.is_tensor(mask):
+        mask = mask.detach()
+    if mask.numel() == 0:
+        return None
+    return float(mask.float().mean().item())
+
+
+def _update_forward_stats(stats, model, cfg, total_time):
+    stats["total_calls"] += 1
+    stats["total_time"] += total_time
+    if not hasattr(model, "get_token_selection_state"):
+        return
+    state = model.get_token_selection_state()
+    if not isinstance(state, dict):
+        return
+    timing = state.get("last_timing") or {}
+    if not cfg.token_selection_enabled:
+        base = stats["base"]
+        base["count"] += 1
+        base["total"] += total_time
+        base["vision"] += float(timing.get("vision", 0.0))
+        base["language"] += float(timing.get("language", 0.0))
+        base["action"] += float(timing.get("action", 0.0))
+        return
+
+    eval_frame = bool(state.get("last_eval_frame", False))
+    bucket = stats["eval"] if eval_frame else stats["prune"]
+    bucket["count"] += 1
+    bucket["total"] += total_time
+    bucket["vision"] += float(timing.get("vision", 0.0))
+    bucket["language"] += float(timing.get("language", 0.0))
+    bucket["action"] += float(timing.get("action", 0.0))
+    if eval_frame:
+        bucket["eval"] += float(timing.get("eval", 0.0))
+
+    keep_mask = state.get("last_keep_mask")
+    prune_ratio = None
+    if keep_mask is not None:
+        keep_ratio = _mask_ratio(keep_mask)
+        if keep_ratio is not None:
+            prune_ratio = 1.0 - keep_ratio
+
+    important_mask = state.get("last_effective_important_mask")
+    if important_mask is None:
+        base_important = state.get("last_important_mask")
+        if base_important is not None and keep_mask is not None:
+            important_mask = base_important & keep_mask
+    important_ratio = _mask_ratio(important_mask)
+    background_ratio = _mask_ratio(state.get("last_background_mask")) if not eval_frame else None
+
+    if prune_ratio is not None and not eval_frame:
+        bucket["prune_ratio"] += prune_ratio
+    if important_ratio is not None:
+        bucket["important_ratio"] += important_ratio
+    if background_ratio is not None:
+        bucket["background_ratio"] += background_ratio
+    if important_ratio is not None or prune_ratio is not None:
+        bucket["ratio_count"] += 1
+
+
+def _format_forward_stats(stats):
+    if stats["total_calls"] == 0:
+        return []
+    lines = []
+    total_avg = stats["total_time"] / stats["total_calls"]
+    lines.append(
+        f"Forward均值: {total_avg * 1000:.1f} ms | 全部运行数={stats['total_calls']} | 总步数={stats['total_steps']}"
+    )
+
+    def _fmt_ms(value):
+        return f"{value * 1000:6.1f} ms"
+
+    def _fmt_pct(value):
+        return f"{value * 100:5.1f}%"
+
+    def _pad(label, value, width):
+        return f"{label} {value}".ljust(width)
+
+    base_stats = stats["base"]
+    if base_stats["count"] > 0:
+        lines.append(
+            "推理均值: "
+            + " | ".join(
+                [
+                    _pad("总", _fmt_ms(base_stats["total"] / base_stats["count"]), 10),
+                    _pad("视觉", _fmt_ms(base_stats["vision"] / base_stats["count"]), 10),
+                    _pad("语言", _fmt_ms(base_stats["language"] / base_stats["count"]), 10),
+                    _pad("L1头", _fmt_ms(base_stats["action"] / base_stats["count"]), 10),
+                    f"运行数={base_stats['count']}",
+                ]
+            )
+        )
+
+    eval_stats = stats["eval"]
+    if eval_stats["count"] > 0:
+        ratio_count = max(1, eval_stats["ratio_count"])
+        seg_total = _pad("总", _fmt_ms(eval_stats["total"] / eval_stats["count"]), 10)
+        seg_important = _pad("重要", _fmt_pct(eval_stats["important_ratio"] / ratio_count), 10)
+        seg_eval = _pad("评估", _fmt_ms(eval_stats["eval"] / eval_stats["count"]), 10)
+        seg_vision = _pad("视觉", _fmt_ms(eval_stats["vision"] / eval_stats["count"]), 10)
+        seg_language = _pad("语言", _fmt_ms(eval_stats["language"] / eval_stats["count"]), 10)
+        seg_action = _pad("L1头", _fmt_ms(eval_stats["action"] / eval_stats["count"]), 10)
+        seg_prune = _pad("剪枝", "--", 10)
+        seg_background = _pad("背景", "--", 10)
+        lines.append(
+            "评估帧均值: "
+            + " | ".join(
+                [
+                    seg_total,
+                    seg_important,
+                    seg_eval,
+                    seg_vision,
+                    seg_language,
+                    seg_action,
+                    seg_prune,
+                    seg_background,
+                    f"评估运行数={eval_stats['count']}",
+                ]
+            )
+        )
+
+    prune_stats = stats["prune"]
+    if prune_stats["count"] > 0:
+        ratio_count = max(1, prune_stats["ratio_count"])
+        seg_total = _pad("总", _fmt_ms(prune_stats["total"] / prune_stats["count"]), 10)
+        seg_important = _pad("重要", _fmt_pct(prune_stats["important_ratio"] / ratio_count), 10)
+        seg_eval = _pad("评估", "--", 10)
+        seg_vision = _pad("视觉", _fmt_ms(prune_stats["vision"] / prune_stats["count"]), 10)
+        seg_language = _pad("语言", _fmt_ms(prune_stats["language"] / prune_stats["count"]), 10)
+        seg_action = _pad("L1头", _fmt_ms(prune_stats["action"] / prune_stats["count"]), 10)
+        seg_prune = _pad("剪枝", _fmt_pct(prune_stats["prune_ratio"] / ratio_count), 10)
+        seg_background = _pad("背景", _fmt_pct(prune_stats["background_ratio"] / ratio_count), 10)
+        lines.append(
+            "剪枝帧均值: "
+            + " | ".join(
+                [
+                    seg_total,
+                    seg_important,
+                    seg_eval,
+                    seg_vision,
+                    seg_language,
+                    seg_action,
+                    seg_prune,
+                    seg_background,
+                    f"剪枝运行数={prune_stats['count']}",
+                ]
+            )
+        )
+    return lines
 
 
 def process_action(action, model_family):
@@ -447,6 +666,8 @@ def run_episode(
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
     last_overlay_grid = None
     last_region_scores = None
+    forward_stats = _init_forward_stats()
+    steps_executed = 0
 
     # Run episode
     success = False
@@ -455,6 +676,7 @@ def run_episode(
             # Do nothing for the first few timesteps to let objects stabilize
             if t < cfg.num_steps_wait:
                 obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
+                steps_executed += 1
                 t += 1
                 continue
 
@@ -468,6 +690,9 @@ def run_episode(
             # If action queue is empty, requery model
             if len(action_queue) == 0:
                 # Query model to get action
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                start_time = time.perf_counter()
                 actions = get_action(
                     cfg,
                     model,
@@ -479,6 +704,10 @@ def run_episode(
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
                 )
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                forward_time = time.perf_counter() - start_time
+                _update_forward_stats(forward_stats, model, cfg, forward_time)
                 action_queue.extend(actions)
                 if cfg.token_selection_enabled:
                     overlay_grid, region_scores = _extract_overlay_state(model, cfg)
@@ -495,6 +724,7 @@ def run_episode(
 
             # Execute action in environment
             obs, reward, done, info = env.step(action.tolist())
+            steps_executed += 1
             if done:
                 success = True
                 break
@@ -503,7 +733,8 @@ def run_episode(
     except Exception as e:
         log_message(f"Episode error: {e}", log_file)
 
-    return success, replay_images
+    forward_stats["total_steps"] = steps_executed
+    return success, replay_images, forward_stats
 
 
 def run_task(
@@ -555,7 +786,7 @@ def run_task(
         log_message(f"Starting episode {task_episodes + 1}...", log_file)
 
         # Run episode
-        success, replay_images = run_episode(
+        success, replay_images, forward_stats = run_episode(
             cfg,
             env,
             task_description,
@@ -578,13 +809,20 @@ def run_task(
 
         # Save replay video
         save_rollout_video(
-            replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file
+            replay_images,
+            total_episodes,
+            success=success,
+            task_description=task_description,
+            rollout_dir=cfg.rollout_dir,
+            log_file=log_file,
         )
 
         # Log results
         log_message(f"Success: {success}", log_file)
         log_message(f"# episodes completed so far: {total_episodes}", log_file)
         log_message(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)", log_file)
+        for line in _format_forward_stats(forward_stats):
+            log_message(line, log_file)
 
     # Log task results
     task_success_rate = float(task_successes) / float(task_episodes) if task_episodes > 0 else 0
@@ -622,6 +860,12 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     # Setup logging
     log_file, local_log_filepath, run_id = setup_logging(cfg)
+    log_message(f"Command: {shlex.join(sys.argv)}", log_file)
+    if log_file:
+        log_file.write("Config:\n")
+        log_file.write(json.dumps(cfg.__dict__, indent=2, sort_keys=True, default=str))
+        log_file.write("\n")
+        log_file.flush()
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
