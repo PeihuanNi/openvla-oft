@@ -292,6 +292,10 @@ class TokenSelectionConfig:
     grad_region_mass: float = 0.25
     grad_region_ema: Optional[float] = None
     grad_keep_prev: bool = False
+    grad_score_method: str = "full_grad"
+    partial_grad_phi: str = "l2"
+    partial_grad_pos_weight: float = 1.0
+    partial_grad_grip_weight: float = 2.0
     grad_tau: float = 0.1
     grad_alpha: float = 1.0
     grad_beta: float = 1.0
@@ -1097,6 +1101,150 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         return keep_final, clipped_mask
 
+    def _get_attn_out_proj_weight(self) -> Optional[torch.Tensor]:
+        lm = self.language_model
+        layer_candidates = [
+            ("model", "layers"),
+            ("base_model", "model", "layers"),
+            ("model", "decoder", "layers"),
+            ("transformer", "h"),
+            ("model", "h"),
+        ]
+        layers = None
+        for path in layer_candidates:
+            obj = lm
+            for name in path:
+                if not hasattr(obj, name):
+                    obj = None
+                    break
+                obj = getattr(obj, name)
+            if obj is not None:
+                layers = obj
+                break
+        if not layers:
+            return None
+        last_layer = layers[-1]
+        attn = getattr(last_layer, "self_attn", None)
+        if attn is None:
+            return None
+        for proj_name in ("o_proj", "out_proj"):
+            proj = getattr(attn, proj_name, None)
+            if proj is not None and hasattr(proj, "weight"):
+                return proj.weight
+        return None
+
+    def _compute_partial_grad_scores(
+        self,
+        action_head,
+        actions_hidden_states: torch.Tensor,
+        action_pred: torch.Tensor,
+        attn_weights: torch.Tensor,
+        num_prompt_tokens: int,
+        num_patches_with_extra: int,
+        token_cfg: TokenSelectionConfig,
+    ) -> Optional[torch.Tensor]:
+        if (
+            action_head is None
+            or actions_hidden_states is None
+            or action_pred is None
+            or attn_weights is None
+        ):
+            return None
+        if actions_hidden_states.dim() != 3 or action_pred.dim() != 3:
+            return None
+        w_o = self._get_attn_out_proj_weight()
+        if w_o is None:
+            logger.warning("Partial-grad scoring requires attention output projection; falling back.")
+            return None
+
+        B, action_tokens, hidden_dim = actions_hidden_states.shape
+        num_heads = attn_weights.shape[1]
+        if num_heads <= 0 or hidden_dim % num_heads != 0:
+            logger.warning("Partial-grad scoring has incompatible head dimensions; falling back.")
+            return None
+
+        phi = str(token_cfg.partial_grad_phi).lower()
+        if phi == "l1":
+            phi_prime = torch.sign(action_pred)
+        else:
+            phi_prime = 2.0 * action_pred
+
+        lambda_weights = torch.full(
+            (action_pred.shape[-1],),
+            float(token_cfg.partial_grad_pos_weight),
+            device=action_pred.device,
+            dtype=action_pred.dtype,
+        )
+        lambda_weights[-1] = float(token_cfg.partial_grad_grip_weight)
+        g_a = phi_prime * lambda_weights
+        chunk_weights = torch.ones(
+            (action_pred.shape[1],),
+            device=action_pred.device,
+            dtype=action_pred.dtype,
+        )
+        g_a = g_a * chunk_weights.view(1, -1, 1)
+
+        with torch.enable_grad():
+            z_p = actions_hidden_states.detach().requires_grad_(True)
+            pred = action_head.predict_action(z_p)
+            g_z = torch.autograd.grad(
+                pred,
+                z_p,
+                grad_outputs=g_a,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )[0]
+        if g_z is None:
+            return None
+
+        w_o = w_o.to(g_z.device)
+        g_concat = torch.matmul(g_z.float(), w_o.float().t())
+        head_dim = g_concat.shape[-1] // num_heads
+        if head_dim * num_heads != g_concat.shape[-1]:
+            return None
+        g_head = g_concat.view(B, action_tokens, num_heads, head_dim)
+        g_head_norm = torch.linalg.norm(g_head, dim=-1)
+
+        vision_count = (
+            self.vision_backbone.get_num_images_in_input()
+            * self.vision_backbone.get_num_patches()
+        )
+        action_start = int(num_patches_with_extra) + int(num_prompt_tokens)
+        action_end = action_start + action_tokens
+        vision_start = 1
+        vision_end = vision_start + vision_count
+        seq_len = attn_weights.shape[-1]
+        if action_end > seq_len or vision_end > seq_len:
+            return None
+
+        attn_sel = attn_weights[:, :, action_start:action_end, vision_start:vision_end]
+        g_norm = g_head_norm.permute(0, 2, 1).unsqueeze(-1)
+        scores = (attn_sel.float() * g_norm).sum(dim=(1, 2))
+        return scores
+
+    def _compute_attn_only_scores(
+        self,
+        attn_weights: torch.Tensor,
+        action_tokens: int,
+        num_prompt_tokens: int,
+        num_patches_with_extra: int,
+    ) -> Optional[torch.Tensor]:
+        if attn_weights is None or attn_weights.dim() != 4:
+            return None
+        num_images = self.vision_backbone.get_num_images_in_input()
+        num_patches = self.vision_backbone.get_num_patches()
+        vision_count = num_images * num_patches
+        action_start = int(num_patches_with_extra) + int(num_prompt_tokens)
+        action_end = action_start + int(action_tokens)
+        vision_start = 1
+        vision_end = vision_start + vision_count
+        seq_len = attn_weights.shape[-1]
+        if action_end > seq_len or vision_end > seq_len:
+            return None
+        attn_sel = attn_weights[:, :, action_start:action_end, vision_start:vision_end]
+        return attn_sel.float().sum(dim=(1, 2))
+
     def _build_overlay_labels(
         self,
         keep_final: torch.Tensor,
@@ -1240,6 +1388,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PROMPT_TOKENS,
         action_head=None,
         return_actions_tensor: bool = False,
+        return_attentions: bool = False,
         timing: Optional[Dict[str, float]] = None,
         timer_device: Optional[torch.device] = None,
     ):
@@ -1268,7 +1417,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             inputs_embeds=multimodal_embeddings,
             labels=None,
             use_cache=None,
-            output_attentions=False,
+            output_attentions=return_attentions,
             output_hidden_states=True,
             return_dict=True,
         )
@@ -1276,6 +1425,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             if timer_device.type == "cuda":
                 torch.cuda.synchronize(timer_device)
             timing["language"] = timing.get("language", 0.0) + (time.perf_counter() - lm_start)
+
+        last_attn = None
+        if return_attentions and language_model_output.attentions:
+            last_attn = language_model_output.attentions[-1]
 
         # Extract hidden states for action tokens
         last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
@@ -1320,7 +1473,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         if not return_actions_tensor:
             normalized_actions_tensor = None
-
+        if return_attentions:
+            return normalized_actions, actions_hidden_states, normalized_actions_tensor, last_attn
         return normalized_actions, actions_hidden_states, normalized_actions_tensor
 
     def predict_action(
@@ -1505,8 +1659,16 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         eval_frame = (state["frame_idx"] % interval) == 0
         state["frame_idx"] += 1
         state["last_eval_frame"] = eval_frame
+        score_method = str(getattr(token_cfg, "grad_score_method", "full_grad")).lower()
+        use_partial_grad = eval_frame and score_method == "partial_grad"
+        use_attn_only = eval_frame and score_method == "attn_only"
+        if (use_partial_grad or use_attn_only) and use_diffusion:
+            logger.warning("Attention/partial-grad scoring does not support diffusion; falling back to full grad.")
+            use_partial_grad = False
+            use_attn_only = False
+        use_full_grad = eval_frame and not (use_partial_grad or use_attn_only)
 
-        with torch.set_grad_enabled(eval_frame):
+        with torch.set_grad_enabled(use_full_grad):
             # Prepare inputs by adding necessary tokens
             input_ids, attention_mask = self._prepare_input_for_action_prediction(input_ids, attention_mask)
 
@@ -1543,7 +1705,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     update_mask = update_mask.unsqueeze(0)
                 image_embs = torch.where(update_mask.unsqueeze(-1), image_embs_new, state["last_image_embs"])
 
-            if eval_frame:
+            if use_full_grad:
                 image_embs.requires_grad_(True)
 
             background_mask = self._compute_background_mask(
@@ -1640,6 +1802,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
                 normalized_actions_tensor = None
                 noise_preds = None
+                last_attn = None
                 if use_diffusion:
                     NUM_PATCHES = projected_patch_embeddings.shape[1] + 1
                     noise = torch.randn(
@@ -1665,8 +1828,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     )
                 else:
                     NUM_PATCHES = projected_patch_embeddings.shape[1]
-                    normalized_actions, actions_hidden_states, normalized_actions_tensor = (
-                        self._regression_or_discrete_prediction(
+                    if use_partial_grad:
+                        (
+                            normalized_actions,
+                            actions_hidden_states,
+                            normalized_actions_tensor,
+                            last_attn,
+                        ) = self._regression_or_discrete_prediction(
                             input_embeddings,
                             all_actions_mask,
                             projected_patch_embeddings,
@@ -1676,51 +1844,121 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                             NUM_PROMPT_TOKENS,
                             action_head,
                             return_actions_tensor=True,
+                            return_attentions=True,
                             timing=timing,
                             timer_device=timer_device,
                         )
-                    )
+                    elif use_attn_only:
+                        (
+                            normalized_actions,
+                            actions_hidden_states,
+                            normalized_actions_tensor,
+                            last_attn,
+                        ) = self._regression_or_discrete_prediction(
+                            input_embeddings,
+                            all_actions_mask,
+                            projected_patch_embeddings,
+                            attention_mask,
+                            labels,
+                            NUM_PATCHES,
+                            NUM_PROMPT_TOKENS,
+                            action_head,
+                            return_actions_tensor=True,
+                            return_attentions=True,
+                            timing=timing,
+                            timer_device=timer_device,
+                        )
+                    else:
+                        normalized_actions, actions_hidden_states, normalized_actions_tensor = (
+                            self._regression_or_discrete_prediction(
+                                input_embeddings,
+                                all_actions_mask,
+                                projected_patch_embeddings,
+                                attention_mask,
+                                labels,
+                                NUM_PATCHES,
+                                NUM_PROMPT_TOKENS,
+                                action_head,
+                                return_actions_tensor=True,
+                                timing=timing,
+                                timer_device=timer_device,
+                            )
+                        )
                     if normalized_actions_tensor is None:
                         raise ValueError("Token selection requires regression action head when diffusion is disabled.")
 
                 eval_start = _timing_start()
+                token_scores = None
                 gate = 0.0
-                if token_cfg.grad_tau > 0:
-                    gripper = normalized_actions[:, -1]
-                    if gripper.shape[0] > 1:
-                        m = float(np.mean(np.abs(gripper[1:] - gripper[:-1])))
-                    else:
-                        m = 0.0
-                    gate = float(np.clip(m / token_cfg.grad_tau, 0.0, 1.0))
-                lambda_grip = 1.0 + token_cfg.grad_alpha * gate
-                lambda_pos = 1.0 + token_cfg.grad_beta * (1.0 - gate)
-
-                objective = torch.zeros((), device=image_embs.device, dtype=image_embs.dtype)
-                if use_diffusion:
-                    for noise_pred in noise_preds:
-                        v_pos = noise_pred[..., :-1]
-                        v_grip = noise_pred[..., -1]
-                        objective = objective + lambda_pos * (v_pos.pow(2).sum()) + lambda_grip * (v_grip.pow(2).sum())
+                lambda_pos = 1.0
+                lambda_grip = 1.0
+                if use_partial_grad:
+                    lambda_pos = float(token_cfg.partial_grad_pos_weight)
+                    lambda_grip = float(token_cfg.partial_grad_grip_weight)
+                    token_scores = self._compute_partial_grad_scores(
+                        action_head,
+                        actions_hidden_states,
+                        normalized_actions_tensor,
+                        last_attn,
+                        NUM_PROMPT_TOKENS,
+                        NUM_PATCHES,
+                        token_cfg,
+                    )
+                    if token_scores is None:
+                        token_scores = torch.linalg.norm(image_embs.detach().float(), dim=-1)
+                elif use_attn_only:
+                    token_scores = self._compute_attn_only_scores(
+                        last_attn,
+                        actions_hidden_states.shape[1],
+                        NUM_PROMPT_TOKENS,
+                        NUM_PATCHES,
+                    )
+                    if token_scores is None:
+                        token_scores = torch.linalg.norm(image_embs.detach().float(), dim=-1)
                 else:
-                    v_pos = normalized_actions_tensor[..., :-1]
-                    v_grip = normalized_actions_tensor[..., -1]
-                    objective = objective + lambda_pos * (v_pos.pow(2).sum()) + lambda_grip * (v_grip.pow(2).sum())
+                    if token_cfg.grad_tau > 0:
+                        gripper = normalized_actions[:, -1]
+                        if gripper.shape[0] > 1:
+                            m = float(np.mean(np.abs(gripper[1:] - gripper[:-1])))
+                        else:
+                            m = 0.0
+                        gate = float(np.clip(m / token_cfg.grad_tau, 0.0, 1.0))
+                    lambda_grip = 1.0 + token_cfg.grad_alpha * gate
+                    lambda_pos = 1.0 + token_cfg.grad_beta * (1.0 - gate)
 
-                image_grads = torch.autograd.grad(
-                    objective,
-                    image_embs,
-                    retain_graph=False,
-                    create_graph=False,
-                    allow_unused=True,
-                )[0]
-                if image_grads is None:
-                    image_grads = torch.zeros_like(image_embs)
+                    objective = torch.zeros((), device=image_embs.device, dtype=image_embs.dtype)
+                    if use_diffusion:
+                        for noise_pred in noise_preds:
+                            v_pos = noise_pred[..., :-1]
+                            v_grip = noise_pred[..., -1]
+                            objective = objective + lambda_pos * (v_pos.pow(2).sum()) + lambda_grip * (
+                                v_grip.pow(2).sum()
+                            )
+                    else:
+                        v_pos = normalized_actions_tensor[..., :-1]
+                        v_grip = normalized_actions_tensor[..., -1]
+                        objective = objective + lambda_pos * (v_pos.pow(2).sum()) + lambda_grip * (
+                            v_grip.pow(2).sum()
+                        )
 
-                # Use float32 for norms to avoid unsupported bf16 linalg ops.
-                grad_norm = torch.linalg.norm(image_grads.float(), dim=-1)
-                token_norm = torch.linalg.norm(image_embs.detach().float(), dim=-1)
-                token_scores = grad_norm * token_norm
-                token_scores = token_scores.detach()
+                    image_grads = torch.autograd.grad(
+                        objective,
+                        image_embs,
+                        retain_graph=False,
+                        create_graph=False,
+                        allow_unused=True,
+                    )[0]
+                    if image_grads is None:
+                        image_grads = torch.zeros_like(image_embs)
+
+                    # Use float32 for norms to avoid unsupported bf16 linalg ops.
+                    grad_norm = torch.linalg.norm(image_grads.float(), dim=-1)
+                    token_norm = torch.linalg.norm(image_embs.detach().float(), dim=-1)
+                    token_scores = grad_norm * token_norm
+                    token_scores = token_scores.detach()
+
+                if token_scores is not None:
+                    token_scores = token_scores.detach()
 
                 region_scores = self._compute_region_scores(token_scores, token_cfg.region_patch_size)
                 if token_cfg.grad_region_ema is not None and state["last_region_scores"] is not None:

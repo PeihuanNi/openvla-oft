@@ -122,6 +122,10 @@ class GenerateConfig:
     grad_region_mass: float = 0.70                   # Mass threshold for region selection (normalized)
     grad_region_ema: Optional[float] = 0.70          # EMA factor for region scores (None disables)
     grad_keep_prev: bool = False                     # Union important mask with previous frame
+    grad_score_method: str = "full_grad"             # "full_grad", "partial_grad", or "attn_only"
+    partial_grad_phi: str = "l2"                     # "l2" or "l1"
+    partial_grad_pos_weight: float = 1.0             # Pos dims weight for partial grad
+    partial_grad_grip_weight: float = 2.0            # Grip dim weight for partial grad
     grad_tau: float = 0.1                            # Gripper change scale for adaptive weighting
     grad_alpha: float = 1.0                          # Gripper weight scale
     grad_beta: float = 1.0                           # Position weight scale
@@ -177,6 +181,17 @@ def validate_config(cfg: GenerateConfig) -> None:
         assert cfg.grad_denoise_steps >= 1, "grad_denoise_steps must be >= 1."
         if cfg.max_kept_tokens is not None:
             assert cfg.max_kept_tokens >= cfg.min_kept_tokens, "max_kept_tokens must be >= min_kept_tokens."
+        score_method = str(cfg.grad_score_method).lower()
+        assert score_method in {"full_grad", "partial_grad", "attn_only"}, (
+            "grad_score_method must be one of: full_grad, partial_grad, attn_only."
+        )
+        if score_method in {"partial_grad", "attn_only"}:
+            assert cfg.use_l1_regression and not cfg.use_diffusion, (
+                "partial_grad/attn_only scoring requires L1 regression and does not support diffusion."
+            )
+        if score_method == "partial_grad":
+            phi = str(cfg.partial_grad_phi).lower()
+            assert phi in {"l1", "l2"}, "partial_grad_phi must be 'l1' or 'l2'."
 
 
 def initialize_model(cfg: GenerateConfig):

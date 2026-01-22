@@ -26,12 +26,16 @@ LOAD_IN_4BIT=False
 
 TOKEN_SELECTION_ENABLED=True
 TOKEN_PRUNE_ENABLED=True
-VISION_PARTIAL_UPDATE_ENABLED=True
-REGION_EVAL_INTERVAL=3
+VISION_PARTIAL_UPDATE_ENABLED=False
+REGION_EVAL_INTERVAL=2
 GRAD_DENOISE_STEPS=1
 GRAD_REGION_MASS=0.7
 GRAD_REGION_EMA=0.7
 GRAD_KEEP_PREV=False
+GRAD_SCORE_METHOD="partial_grad" # full_grad | partial_grad | attn_only
+PARTIAL_GRAD_PHI="l2"
+PARTIAL_GRAD_POS_WEIGHT=1.0
+PARTIAL_GRAD_GRIP_WEIGHT=3.0
 GRAD_TAU=0.1
 GRAD_ALPHA=1.0
 GRAD_BETA=1.0
@@ -44,13 +48,13 @@ REGION_PATCH_SIZE=2
 
 TASK_SUITE_NAME="libero_spatial"
 NUM_STEPS_WAIT=10
-NUM_TRIALS_PER_TASK=50
+NUM_TRIALS_PER_TASK=5
 INITIAL_STATES_PATH="DEFAULT"
 ENV_IMG_RES=256
 
 RUN_ID_NOTE=""
 LOCAL_LOG_DIR="./experiments/logs"
-ROLLOUT_DIR="./rollouts/2026_01_21/speed/"
+ROLLOUT_DIR="./rollouts/2026_01_21/partial_grad_grip=3-prune/"
 USE_WANDB=False
 WANDB_ENTITY="your-wandb-entity"
 WANDB_PROJECT="your-wandb-project"
@@ -78,6 +82,10 @@ args=(
   --grad_denoise_steps "${GRAD_DENOISE_STEPS}"
   --grad_region_mass "${GRAD_REGION_MASS}"
   --grad_keep_prev "${GRAD_KEEP_PREV}"
+  --grad_score_method "${GRAD_SCORE_METHOD}"
+  --partial_grad_phi "${PARTIAL_GRAD_PHI}"
+  --partial_grad_pos_weight "${PARTIAL_GRAD_POS_WEIGHT}"
+  --partial_grad_grip_weight "${PARTIAL_GRAD_GRIP_WEIGHT}"
   --grad_tau "${GRAD_TAU}"
   --grad_alpha "${GRAD_ALPHA}"
   --grad_beta "${GRAD_BETA}"
