@@ -7,8 +7,10 @@ but exactly replicate the logic in `prismatic.models.vlms.prismatic.py`.
 """
 
 import logging
+import os
 import math
 import time
+import types
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
@@ -20,6 +22,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
+try:
+    from torch.profiler import ProfilerActivity, profile as torch_profile
+except Exception:
+    ProfilerActivity = None
+    torch_profile = None
 from timm.models.vision_transformer import LayerScale
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
@@ -42,6 +49,46 @@ from .configuration_prismatic import OpenVLAConfig, PrismaticConfig
 
 # Set up logger
 logger = logging.getLogger(__name__)
+
+
+class _StderrSuppressor:
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self._saved_fd = None
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        self._saved_fd = os.dup(2)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 2)
+        os.close(devnull)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._saved_fd is not None:
+            os.dup2(self._saved_fd, 2)
+            os.close(self._saved_fd)
+            self._saved_fd = None
+        return False
+
+
+def _profile_flops(fn: Callable[[], Any], silent: bool = False) -> Tuple[Any, float]:
+    if torch_profile is None or ProfilerActivity is None:
+        return fn(), 0.0
+    with _StderrSuppressor(silent), torch_profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        with_flops=True,
+        record_shapes=False,
+        profile_memory=False,
+    ) as prof:
+        result = fn()
+    total_flops = 0.0
+    for evt in prof.key_averages():
+        flops = getattr(evt, "flops", None)
+        if flops:
+            total_flops += float(flops)
+    return result, total_flops
 
 
 # === Utility Functions for Monkey-Patching ===
@@ -287,6 +334,8 @@ class TokenSelectionConfig:
     token_selection_enabled: bool = False
     token_prune_enabled: bool = False
     vision_partial_update_enabled: bool = False
+    flops_profile_enabled: bool = False
+    flops_profile_silent: bool = True
     region_eval_interval: int = 1
     grad_denoise_steps: int = 1
     grad_region_mass: float = 0.25
@@ -296,6 +345,12 @@ class TokenSelectionConfig:
     partial_grad_phi: str = "l2"
     partial_grad_pos_weight: float = 1.0
     partial_grad_grip_weight: float = 2.0
+    attn_score_beta: float = 1.0
+    head_consensus_gating_enabled: bool = False
+    head_consensus_eta: float = 1.0
+    head_g_beta: float = 1.0
+    head_g_norm: str = "sum"
+    token_reuse_mode: str = "none"
     grad_tau: float = 0.1
     grad_alpha: float = 1.0
     grad_beta: float = 1.0
@@ -464,6 +519,110 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         next_actions_mask = get_next_actions_mask(labels)
         all_actions_mask = current_action_mask | next_actions_mask  # (B, seq_len)
         return all_actions_mask
+
+    @staticmethod
+    def _estimate_transformer_flops(n_tokens: int, hidden_dim: int, mlp_dim: int, num_layers: int, batch: int) -> float:
+        if n_tokens <= 1 or hidden_dim <= 0 or mlp_dim <= 0 or num_layers <= 0 or batch <= 0:
+            return 0.0
+        n = float(n_tokens)
+        d = float(hidden_dim)
+        m = float(mlp_dim)
+        return float(batch) * float(num_layers) * (4.0 * n * d * d + 2.0 * n * n * d + 3.0 * n * d * m)
+
+    def _estimate_llm_flops(self, seq_len: int, batch: int) -> float:
+        cfg = getattr(self.language_model, "config", None)
+        if cfg is None:
+            return 0.0
+        hidden_dim = int(getattr(cfg, "hidden_size", 0) or 0)
+        mlp_dim = int(getattr(cfg, "intermediate_size", 0) or 0)
+        if mlp_dim <= 0 and hidden_dim > 0:
+            mlp_dim = 4 * hidden_dim
+        num_layers = int(getattr(cfg, "num_hidden_layers", 0) or 0)
+        return self._estimate_transformer_flops(seq_len, hidden_dim, mlp_dim, num_layers, batch)
+
+    def _estimate_vit_flops(self, model: nn.Module, tokens_per_image: int, num_images: int, batch: int) -> float:
+        if model is None:
+            return 0.0
+        blocks = getattr(model, "blocks", None)
+        if blocks is None or len(blocks) == 0:
+            return 0.0
+        hidden_dim = int(getattr(model, "embed_dim", 0) or 0)
+        if hidden_dim <= 0:
+            return 0.0
+        block0 = blocks[0]
+        mlp = getattr(block0, "mlp", None)
+        mlp_dim = 0
+        if mlp is not None:
+            fc1 = getattr(mlp, "fc1", None)
+            if fc1 is not None and hasattr(fc1, "out_features"):
+                mlp_dim = int(fc1.out_features)
+            elif hasattr(mlp, "hidden_features"):
+                mlp_dim = int(mlp.hidden_features)
+        if mlp_dim <= 0:
+            return 0.0
+        num_layers = len(blocks)
+        return self._estimate_transformer_flops(tokens_per_image, hidden_dim, mlp_dim, num_layers, batch * num_images)
+
+    def _estimate_projector_flops(self, tokens: int, batch: int) -> float:
+        if tokens <= 0 or batch <= 0:
+            return 0.0
+        flops = 0.0
+        for layer_name in ("fc1", "fc2", "fc3"):
+            layer = getattr(self.projector, layer_name, None)
+            if layer is None:
+                continue
+            if hasattr(layer, "in_features") and hasattr(layer, "out_features"):
+                flops += 2.0 * float(batch) * float(tokens) * float(layer.in_features) * float(layer.out_features)
+        return flops
+
+    def _estimate_vision_total_flops(self, batch: int) -> float:
+        num_images = self.vision_backbone.get_num_images_in_input()
+        num_patches = self.vision_backbone.get_num_patches()
+        if num_images <= 0 or num_patches <= 0 or batch <= 0:
+            return 0.0
+        featurizer = getattr(self.vision_backbone, "featurizer", None)
+        prefix = int(getattr(featurizer, "num_prefix_tokens", 0) or 0) if featurizer is not None else 0
+        tokens_per_image = num_patches + max(prefix, 0)
+        flops = self._estimate_vit_flops(featurizer, tokens_per_image, num_images, batch)
+        if getattr(self.vision_backbone, "use_fused_vision_backbone", False):
+            fused = getattr(self.vision_backbone, "fused_featurizer", None)
+            prefix_fused = int(getattr(fused, "num_prefix_tokens", 0) or 0) if fused is not None else 0
+            tokens_per_image_fused = num_patches + max(prefix_fused, 0)
+            flops += self._estimate_vit_flops(fused, tokens_per_image_fused, num_images, batch)
+        flops += self._estimate_projector_flops(num_patches * num_images, batch)
+        return flops
+
+    def _estimate_action_head_flops(self, action_head: nn.Module, num_chunks: int, batch: int) -> float:
+        if action_head is None or num_chunks <= 0 or batch <= 0:
+            return 0.0
+        mlp = None
+        if hasattr(action_head, "model"):
+            mlp = getattr(action_head, "model", None)
+        if mlp is None and hasattr(action_head, "noise_predictor"):
+            noise_pred = getattr(action_head, "noise_predictor", None)
+            if noise_pred is not None and hasattr(noise_pred, "mlp_resnet"):
+                mlp = noise_pred.mlp_resnet
+        if mlp is None:
+            return 0.0
+        fc1 = getattr(mlp, "fc1", None)
+        fc2 = getattr(mlp, "fc2", None)
+        if fc1 is None or fc2 is None:
+            return 0.0
+        in_dim = int(getattr(fc1, "in_features", 0) or 0)
+        hidden_dim = int(getattr(fc1, "out_features", 0) or 0)
+        out_dim = int(getattr(fc2, "out_features", 0) or 0)
+        if in_dim <= 0 or hidden_dim <= 0 or out_dim <= 0:
+            return 0.0
+        flops_per = 2.0 * in_dim * hidden_dim + 2.0 * hidden_dim * out_dim
+        blocks = getattr(mlp, "mlp_resnet_blocks", None)
+        if blocks is not None:
+            for block in blocks:
+                linear = getattr(block, "ffn", None)
+                if linear is not None and len(linear) > 1:
+                    layer = linear[1]
+                    if hasattr(layer, "in_features") and hasattr(layer, "out_features"):
+                        flops_per += 2.0 * float(layer.in_features) * float(layer.out_features)
+        return float(batch) * float(num_chunks) * flops_per
 
     def _process_vision_features(self, pixel_values, language_embeddings=None, use_film=False):
         """Process vision features with optional FiLM conditioning"""
@@ -834,6 +993,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             "frame_idx": 0,
             "last_image_embs": None,
             "last_important_mask": None,
+            "last_important_region_mask": None,
             "last_keep_mask": None,
             "last_keep_pre_mask": None,
             "last_clipped_mask": None,
@@ -845,14 +1005,394 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             "last_effective_important_mask": None,
             "last_eval_frame": False,
             "last_timing": None,
+            "last_flops": None,
             "last_gate": None,
             "last_lambda_pos": None,
             "last_lambda_grip": None,
         }
+        self._clear_llm_reuse_context()
+        self._reset_llm_reuse_cache()
 
     def get_token_selection_state(self) -> Dict[str, Any]:
         """Expose last token selection state for debugging/visualization."""
         return self._token_selection_state
+
+    def _get_llama_layers(self):
+        lm = getattr(self, "language_model", None)
+        if lm is None:
+            return None
+        if hasattr(lm, "model") and hasattr(lm.model, "layers"):
+            return lm.model.layers
+        if hasattr(lm, "layers"):
+            return lm.layers
+        return None
+
+    def _ensure_llama_token_reuse_patch(self) -> None:
+        if getattr(self, "_llama_reuse_patched", False):
+            return
+        try:
+            from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
+        except Exception as exc:  # pragma: no cover - depends on runtime install
+            logger.warning("Token reuse patch skipped (missing Llama): %s", exc)
+            self._llama_reuse_patched = False
+            return
+
+        layers = self._get_llama_layers()
+        if not layers:
+            logger.warning("Token reuse patch skipped (no Llama layers found).")
+            self._llama_reuse_patched = False
+            return
+
+        def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        def _apply_rotary_subset(q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
+            return (q * cos) + (_rotate_half(q) * sin)
+
+        def _reuse_attention_forward(
+            self_attn,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_value: Optional[Any] = None,
+            output_attentions: bool = False,
+            use_cache: bool = False,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs,
+        ):
+            reuse_ctx = getattr(self_attn, "_token_reuse_context", None)
+            if reuse_ctx is None or not reuse_ctx.get("enabled", False):
+                return self_attn._orig_forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
+
+            if getattr(self_attn.config, "pretraining_tp", 1) > 1:
+                return self_attn._orig_forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
+
+            reuse_mode = reuse_ctx.get("mode", "none")
+            reuse_mask = reuse_ctx.get("reuse_mask", None)
+            bsz, q_len, _ = hidden_states.size()
+            if reuse_mask is not None:
+                if reuse_mask.shape[:2] != (bsz, q_len):
+                    reuse_mask = None
+            cache = getattr(self_attn, "_token_reuse_cache", None)
+            if reuse_mask is not None:
+                if cache is None or cache.get("k") is None or cache.get("v") is None:
+                    reuse_mask = None
+
+            update_mask = None
+            update_idx = None
+            if reuse_mask is not None:
+                update_mask = ~reuse_mask
+                if bsz != 1:
+                    reuse_mask = None
+                    update_mask = None
+                else:
+                    update_idx = torch.nonzero(update_mask[0], as_tuple=False).squeeze(-1)
+
+            if reuse_mode == "reuse_all" and update_idx is not None:
+                if update_idx.numel() == 0:
+                    attn_output = hidden_states.new_zeros(hidden_states.shape)
+                    return attn_output, None, past_key_value
+                hidden_update = hidden_states[:, update_idx, :]
+                query_states = self_attn.q_proj(hidden_update)
+                key_update = self_attn.k_proj(hidden_update)
+                value_update = self_attn.v_proj(hidden_update)
+                key_states = torch.zeros(
+                    bsz,
+                    q_len,
+                    self_attn.num_key_value_heads * self_attn.head_dim,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+                value_states = torch.zeros_like(key_states)
+                key_states[:, update_idx, :] = key_update
+                value_states[:, update_idx, :] = value_update
+            elif reuse_mode == "reuse_kv" and update_mask is not None:
+                query_states = self_attn.q_proj(hidden_states)
+                key_states = torch.zeros(
+                    bsz,
+                    q_len,
+                    self_attn.num_key_value_heads * self_attn.head_dim,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+                value_states = torch.zeros_like(key_states)
+                if update_mask.any():
+                    hidden_update = hidden_states[update_mask]
+                    key_update = self_attn.k_proj(hidden_update)
+                    value_update = self_attn.v_proj(hidden_update)
+                    key_states[update_mask] = key_update
+                    value_states[update_mask] = value_update
+            else:
+                query_states = self_attn.q_proj(hidden_states)
+                key_states = self_attn.k_proj(hidden_states)
+                value_states = self_attn.v_proj(hidden_states)
+
+            if reuse_mode == "reuse_all" and update_idx is not None:
+                query_states = query_states.view(bsz, update_idx.numel(), self_attn.num_heads, self_attn.head_dim)
+                query_states = query_states.transpose(1, 2)
+            else:
+                query_states = query_states.view(bsz, q_len, self_attn.num_heads, self_attn.head_dim).transpose(1, 2)
+            key_states = key_states.view(bsz, q_len, self_attn.num_key_value_heads, self_attn.head_dim).transpose(1, 2)
+            value_states = value_states.view(bsz, q_len, self_attn.num_key_value_heads, self_attn.head_dim).transpose(
+                1, 2
+            )
+
+            cos, sin = self_attn.rotary_emb(value_states, position_ids)
+            if reuse_mode == "reuse_all" and update_idx is not None:
+                cos_u = cos[:, update_idx, :]
+                sin_u = sin[:, update_idx, :]
+                query_states = _apply_rotary_subset(query_states, cos_u, sin_u)
+                key_states = apply_rotary_pos_emb(
+                    key_states, key_states, cos, sin
+                )[1]
+            else:
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+            if reuse_mask is not None and cache is not None:
+                cached_k = cache.get("k", None)
+                cached_v = cache.get("v", None)
+                if cached_k is not None and cached_k.shape == key_states.shape:
+                    reuse_mask_full = reuse_mask.unsqueeze(1).unsqueeze(-1)
+                    key_states = torch.where(reuse_mask_full, cached_k, key_states)
+                    value_states = torch.where(reuse_mask_full, cached_v, value_states)
+
+            if cache is None:
+                cache = {}
+                self_attn._token_reuse_cache = cache
+            cache["k"] = key_states.detach()
+            cache["v"] = value_states.detach()
+
+            key_states = repeat_kv(key_states, self_attn.num_key_value_groups)
+            value_states = repeat_kv(value_states, self_attn.num_key_value_groups)
+
+            if attention_mask is None or (torch.is_tensor(attention_mask) and attention_mask.dim() == 2):
+                min_dtype = torch.finfo(query_states.dtype).min
+                causal = torch.full(
+                    (q_len, key_states.shape[-2]),
+                    fill_value=min_dtype,
+                    device=query_states.device,
+                    dtype=query_states.dtype,
+                )
+                causal = torch.triu(causal, diagonal=1)
+                causal = causal.unsqueeze(0).unsqueeze(0)
+                if torch.is_tensor(attention_mask) and attention_mask is not None and attention_mask.dim() == 2:
+                    pad = (attention_mask == 0).to(query_states.dtype) * min_dtype
+                    pad = pad.unsqueeze(1).unsqueeze(2)
+                    causal = causal + pad
+                attention_mask = causal
+
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self_attn.head_dim)
+            if attention_mask is not None:
+                if reuse_mode == "reuse_all" and update_idx is not None:
+                    causal_mask = attention_mask[:, :, update_idx, : key_states.shape[-2]]
+                else:
+                    causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+                attn_weights = attn_weights + causal_mask
+
+            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = torch.nn.functional.dropout(attn_weights, p=self_attn.attention_dropout, training=self_attn.training)
+            attn_output = torch.matmul(attn_weights, value_states)
+
+            if reuse_mode == "reuse_all" and update_idx is not None:
+                attn_output = attn_output.transpose(1, 2).contiguous()
+                attn_output = attn_output.reshape(bsz, update_idx.numel(), self_attn.hidden_size)
+            else:
+                attn_output = attn_output.transpose(1, 2).contiguous()
+                attn_output = attn_output.reshape(bsz, q_len, self_attn.hidden_size)
+
+            attn_output = self_attn.o_proj(attn_output)
+
+            if reuse_mode == "reuse_all" and update_idx is not None:
+                full_output = torch.zeros(
+                    bsz, q_len, self_attn.hidden_size, device=attn_output.device, dtype=attn_output.dtype
+                )
+                full_output[:, update_idx, :] = attn_output
+                attn_output = full_output
+
+            if not output_attentions:
+                attn_weights = None
+
+            return attn_output, attn_weights, past_key_value
+
+        def _reuse_layer_forward(
+            self_layer,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_value: Optional[Tuple[torch.Tensor]] = None,
+            output_attentions: Optional[bool] = False,
+            use_cache: Optional[bool] = False,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs,
+        ):
+            reuse_ctx = getattr(self_layer, "_token_reuse_context", None)
+            if reuse_ctx is None or reuse_ctx.get("mode", "none") != "reuse_all":
+                return self_layer._orig_forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
+            reuse_mask = reuse_ctx.get("reuse_mask", None)
+            if reuse_mask is None or reuse_mask.shape[:2] != hidden_states.shape[:2] or hidden_states.shape[0] != 1:
+                return self_layer._orig_forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
+            update_idx = torch.nonzero(~reuse_mask[0], as_tuple=False).squeeze(-1)
+            cache = getattr(self_layer, "_token_reuse_cache", None)
+            cached_input = None if cache is None else cache.get("input", None)
+            cached_output = None if cache is None else cache.get("output", None)
+            if cached_input is not None and cached_input.shape == hidden_states.shape:
+                hidden_states = torch.where(reuse_mask.unsqueeze(-1), cached_input, hidden_states)
+
+            input_cache = hidden_states.detach()
+            residual = hidden_states
+            hidden_states = self_layer.input_layernorm(hidden_states)
+
+            hidden_states, self_attn_weights, present_key_value = self_layer.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+            hidden_states = residual + hidden_states
+
+            residual = hidden_states
+            hidden_states = self_layer.post_attention_layernorm(hidden_states)
+            if update_idx.numel() > 0:
+                update_states = hidden_states[:, update_idx, :]
+                update_states = self_layer.mlp(update_states)
+                hidden_states = hidden_states.clone()
+                hidden_states[:, update_idx, :] = residual[:, update_idx, :] + update_states
+            else:
+                hidden_states = residual
+
+            if cached_output is not None and cached_output.shape == hidden_states.shape:
+                hidden_states = torch.where(reuse_mask.unsqueeze(-1), cached_output, hidden_states)
+
+            if cache is None:
+                cache = {}
+                self_layer._token_reuse_cache = cache
+            cache["input"] = input_cache
+            cache["output"] = hidden_states.detach()
+
+            outputs = (hidden_states,)
+            if output_attentions:
+                outputs += (self_attn_weights,)
+            if use_cache:
+                outputs += (present_key_value,)
+            return outputs
+
+        for layer in layers:
+            if hasattr(layer, "self_attn") and not hasattr(layer.self_attn, "_orig_forward"):
+                layer.self_attn._orig_forward = layer.self_attn.forward
+                layer.self_attn.forward = types.MethodType(_reuse_attention_forward, layer.self_attn)
+            if not hasattr(layer, "_orig_forward"):
+                layer._orig_forward = layer.forward
+                layer.forward = types.MethodType(_reuse_layer_forward, layer)
+
+        self._llama_reuse_patched = True
+
+    def _set_llm_reuse_context(
+        self,
+        reuse_mask: Optional[torch.Tensor],
+        reuse_mode: str,
+        force: bool = False,
+    ) -> None:
+        mode = str(reuse_mode).lower()
+        if mode == "none" and not force:
+            return
+        self._ensure_llama_token_reuse_patch()
+        layers = self._get_llama_layers()
+        if not layers:
+            return
+        ctx = {"enabled": True, "mode": mode, "reuse_mask": reuse_mask}
+        for layer in layers:
+            layer._token_reuse_context = ctx
+            if hasattr(layer, "self_attn"):
+                layer.self_attn._token_reuse_context = ctx
+
+    def _clear_llm_reuse_context(self) -> None:
+        layers = self._get_llama_layers()
+        if not layers:
+            return
+        for layer in layers:
+            if hasattr(layer, "_token_reuse_context"):
+                layer._token_reuse_context = None
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "_token_reuse_context"):
+                layer.self_attn._token_reuse_context = None
+
+    def _reset_llm_reuse_cache(self) -> None:
+        layers = self._get_llama_layers()
+        if not layers:
+            return
+        for layer in layers:
+            if hasattr(layer, "self_attn"):
+                layer.self_attn._token_reuse_cache = {"k": None, "v": None}
+            layer._token_reuse_cache = {"input": None, "output": None}
+
+    def _build_llm_reuse_mask(
+        self,
+        keep_mask: torch.Tensor,
+        num_patch_tokens: int,
+        input_embeddings: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if keep_mask is None:
+            return None
+        if keep_mask.dim() == 1:
+            keep_mask = keep_mask.unsqueeze(0)
+        reuse_patch = ~keep_mask
+        if reuse_patch.shape[1] > num_patch_tokens:
+            reuse_patch = reuse_patch[:, :num_patch_tokens]
+        elif reuse_patch.shape[1] < num_patch_tokens:
+            pad = num_patch_tokens - reuse_patch.shape[1]
+            pad_mask = torch.zeros(
+                (reuse_patch.shape[0], pad), device=reuse_patch.device, dtype=torch.bool
+            )
+            reuse_patch = torch.cat([reuse_patch, pad_mask], dim=1)
+        full_len = 1 + num_patch_tokens + (input_embeddings.shape[1] - 1)
+        reuse_full = torch.zeros(
+            (reuse_patch.shape[0], full_len), device=reuse_patch.device, dtype=torch.bool
+        )
+        reuse_full[:, 1 : 1 + num_patch_tokens] = reuse_patch
+        return reuse_full
 
     def _resolve_token_selection_cfg(self, cfg: Optional[TokenSelectionConfig]) -> Optional[TokenSelectionConfig]:
         if cfg is not None:
@@ -923,14 +1463,37 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         region_scores: torch.Tensor,
         grad_region_mass: float,
         region_patch_size: int,
+        return_region_mask: bool = False,
     ) -> torch.Tensor:
         B, num_images, region_h, region_w = region_scores.shape
         num_patches = self.vision_backbone.get_num_patches()
         total_tokens = num_patches * num_images
         grid_h, grid_w = self._get_patch_grid_size(num_patches)
         region_patch_size = max(1, int(region_patch_size))
-        important_mask = torch.zeros((B, total_tokens), device=region_scores.device, dtype=torch.bool)
+        region_mask = torch.zeros(
+            (B, num_images * region_h * region_w), device=region_scores.device, dtype=torch.bool
+        )
+        if return_region_mask:
+            for b in range(B):
+                for img_idx in range(num_images):
+                    scores_flat = region_scores[b, img_idx].reshape(-1)
+                    if scores_flat.numel() == 0:
+                        continue
+                    total = scores_flat.sum()
+                    if total <= 0:
+                        normalized = torch.full_like(scores_flat, 1.0 / scores_flat.numel())
+                    else:
+                        normalized = scores_flat / total
+                    sorted_scores, sorted_idx = torch.sort(normalized, descending=True)
+                    keep_count = int((sorted_scores.cumsum(dim=0) < grad_region_mass).sum().item()) + 1
+                    keep_count = min(max(keep_count, 1), sorted_scores.numel())
+                    region_keep = torch.zeros_like(scores_flat, dtype=torch.bool)
+                    region_keep[sorted_idx[:keep_count]] = True
+                    start = img_idx * region_h * region_w
+                    region_mask[b, start : start + region_h * region_w] = region_keep
+            return region_mask
 
+        token_mask = torch.zeros((B, total_tokens), device=region_scores.device, dtype=torch.bool)
         for b in range(B):
             for img_idx in range(num_images):
                 scores_flat = region_scores[b, img_idx].reshape(-1)
@@ -952,9 +1515,113 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 )
                 token_mask_flat = token_mask_grid.reshape(-1)
                 start = img_idx * num_patches
-                important_mask[b, start : start + num_patches] = token_mask_flat
+                token_mask[b, start : start + num_patches] = token_mask_flat
 
-        return important_mask
+        return token_mask
+
+    def _expand_region_mask(self, region_mask: torch.Tensor, region_patch_size: int) -> torch.Tensor:
+        if region_mask.dim() == 1:
+            region_mask = region_mask.unsqueeze(0)
+        B, total_regions = region_mask.shape
+        num_images = self.vision_backbone.get_num_images_in_input()
+        num_patches = self.vision_backbone.get_num_patches()
+        grid_h, grid_w = self._get_patch_grid_size(num_patches)
+        region_patch_size = max(1, int(region_patch_size))
+        region_h = grid_h // region_patch_size
+        region_w = grid_w // region_patch_size
+        expected_regions = num_images * region_h * region_w
+        if total_regions != expected_regions:
+            raise ValueError("Region mask shape does not match expected region count.")
+        token_mask = torch.zeros((B, num_images * num_patches), device=region_mask.device, dtype=torch.bool)
+        for img_idx in range(num_images):
+            start_r = img_idx * region_h * region_w
+            end_r = start_r + region_h * region_w
+            region_grid = region_mask[:, start_r:end_r].reshape(B, region_h, region_w)
+            token_grid = region_grid.repeat_interleave(region_patch_size, dim=1).repeat_interleave(
+                region_patch_size, dim=2
+            )
+            start_t = img_idx * num_patches
+            end_t = start_t + num_patches
+            token_mask[:, start_t:end_t] = token_grid.reshape(B, -1)
+        return token_mask
+
+    def _compute_background_region_mask(
+        self,
+        current_tokens: torch.Tensor,
+        last_tokens: Optional[torch.Tensor],
+        token_temporal_threshold: float,
+        token_spatial_threshold: float,
+        token_spatial_radius: int,
+        region_patch_size: int,
+    ) -> torch.Tensor:
+        if current_tokens.dim() == 2:
+            current_tokens = current_tokens.unsqueeze(0)
+        current_tokens_f = current_tokens.float()
+        last_tokens_f = None if last_tokens is None else last_tokens.float()
+        B, total_tokens, _ = current_tokens.shape
+        num_images = self.vision_backbone.get_num_images_in_input()
+        num_patches = self.vision_backbone.get_num_patches()
+        if total_tokens != num_images * num_patches:
+            raise ValueError("Token shape does not match current vision token count.")
+        grid_h, grid_w = self._get_patch_grid_size(num_patches)
+        region_patch_size = max(1, int(region_patch_size))
+        if (grid_h % region_patch_size) != 0 or (grid_w % region_patch_size) != 0:
+            raise ValueError("region_patch_size must evenly divide patch grid dimensions.")
+        region_h = grid_h // region_patch_size
+        region_w = grid_w // region_patch_size
+
+        def _pool_regions(tokens: torch.Tensor) -> torch.Tensor:
+            regions = []
+            for img_idx in range(num_images):
+                start = img_idx * num_patches
+                end = start + num_patches
+                tokens_img = tokens[:, start:end].reshape(B, grid_h, grid_w, -1)
+                pooled = tokens_img.reshape(
+                    B, region_h, region_patch_size, region_w, region_patch_size, -1
+                ).mean(dim=(2, 4))
+                regions.append(pooled)
+            return torch.stack(regions, dim=1)
+
+        current_regions = _pool_regions(current_tokens_f)
+        last_regions = None if last_tokens_f is None else _pool_regions(last_tokens_f)
+
+        temporal_mask = torch.zeros(
+            (B, num_images, region_h, region_w), device=current_tokens.device, dtype=torch.bool
+        )
+        if last_regions is not None and last_regions.shape == current_regions.shape:
+            temporal_sim = F.cosine_similarity(current_regions, last_regions, dim=-1)
+            temporal_mask = temporal_sim >= token_temporal_threshold
+
+        token_spatial_radius = max(0, int(token_spatial_radius))
+        spatial_mask = torch.zeros_like(temporal_mask, dtype=torch.bool)
+        norm_regions = F.normalize(current_regions, dim=-1)
+        for img_idx in range(num_images):
+            regions_img = norm_regions[:, img_idx]
+            for h in range(region_h):
+                h0 = max(0, h - token_spatial_radius)
+                h1 = min(region_h, h + token_spatial_radius + 1)
+                for w in range(region_w):
+                    w0 = max(0, w - token_spatial_radius)
+                    w1 = min(region_w, w + token_spatial_radius + 1)
+                    neighbors = regions_img[:, h0:h1, w0:w1, :].reshape(B, -1, regions_img.shape[-1])
+                    if neighbors.shape[1] == 1:
+                        spatial_sim = torch.ones(B, device=current_tokens.device, dtype=current_tokens.dtype)
+                    else:
+                        sim = (neighbors * regions_img[:, h, w, :].unsqueeze(1)).sum(dim=-1)
+                        self_idx = (h - h0) * (w1 - w0) + (w - w0)
+                        sim = torch.cat([sim[:, :self_idx], sim[:, self_idx + 1 :]], dim=1)
+                        spatial_sim = sim.mean(dim=1)
+                    spatial_mask[:, img_idx, h, w] = spatial_sim >= token_spatial_threshold
+
+        background = temporal_mask & spatial_mask
+        background_flat = torch.zeros(
+            (B, num_images * region_h * region_w), device=current_tokens.device, dtype=torch.bool
+        )
+        for img_idx in range(num_images):
+            start = img_idx * region_h * region_w
+            end = start + region_h * region_w
+            background_flat[:, start:end] = background[:, img_idx].reshape(B, -1)
+        return background_flat
 
     def _compute_background_mask(
         self,
@@ -1101,6 +1768,107 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         return keep_final, clipped_mask
 
+    def _apply_keep_constraints_regions(
+        self,
+        keep_pre: torch.Tensor,
+        region_scores: torch.Tensor,
+        min_kept_tokens: int,
+        max_kept_tokens: Optional[int],
+        region_patch_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if keep_pre.dim() == 1:
+            keep_pre = keep_pre.unsqueeze(0)
+        if region_scores.dim() == 4:
+            region_scores = region_scores.reshape(region_scores.shape[0], -1)
+        if region_scores.dim() == 1:
+            region_scores = region_scores.unsqueeze(0)
+        B, total_regions = keep_pre.shape
+        keep_final = keep_pre.clone()
+        clipped_mask = torch.zeros_like(keep_pre, dtype=torch.bool)
+
+        num_images = self.vision_backbone.get_num_images_in_input()
+        num_patches = self.vision_backbone.get_num_patches()
+        grid_h, grid_w = self._get_patch_grid_size(num_patches)
+        region_patch_size = max(1, int(region_patch_size))
+        region_h = grid_h // region_patch_size
+        region_w = grid_w // region_patch_size
+        regions_per_image = region_h * region_w
+        expected_regions = num_images * regions_per_image
+        if total_regions != expected_regions:
+            raise ValueError("Region mask shape does not match expected region count.")
+
+        region_area = region_patch_size * region_patch_size
+        per_image_min = 0
+        if min_kept_tokens > 0:
+            per_image_min = int(math.ceil(float(min_kept_tokens) / float(region_area)))
+            per_image_min = max(1, per_image_min)
+            per_image_min = min(per_image_min, regions_per_image)
+        per_image_max = None
+        if max_kept_tokens is not None:
+            per_image_max = int(max_kept_tokens) // region_area
+            if per_image_max <= 0:
+                per_image_max = 1
+            per_image_max = min(per_image_max, regions_per_image)
+            if per_image_max < per_image_min:
+                per_image_max = per_image_min
+
+        use_per_image = expected_regions == total_regions and (per_image_min > 0 or per_image_max is not None)
+
+        for b in range(B):
+            keep = keep_final[b].clone()
+            scores = region_scores[b]
+            min_kept = per_image_min if use_per_image else max(0, int(min_kept_tokens))
+            min_kept = min(min_kept, total_regions)
+            max_kept = total_regions
+            if not use_per_image:
+                if max_kept_tokens is not None:
+                    max_kept = int(max_kept_tokens)
+                    if max_kept <= 0:
+                        max_kept = total_regions
+                    max_kept = min(max_kept, total_regions)
+                if min_kept > max_kept:
+                    max_kept = min_kept
+
+            if not use_per_image:
+                if min_kept > 0 and keep.sum().item() < min_kept:
+                    needed = min_kept - int(keep.sum().item())
+                    scores_fill = scores.clone()
+                    scores_fill[keep] = float("-inf")
+                    _, add_idx = torch.topk(scores_fill, k=needed)
+                    keep[add_idx] = True
+                if max_kept is not None and keep.sum().item() > max_kept:
+                    scores_fill = scores.clone()
+                    scores_fill[~keep] = float("-inf")
+                    _, keep_idx = torch.topk(scores_fill, k=max_kept)
+                    new_keep = torch.zeros_like(keep, dtype=torch.bool)
+                    new_keep[keep_idx] = True
+                    keep = new_keep
+            else:
+                for img_idx in range(num_images):
+                    start = img_idx * regions_per_image
+                    end = start + regions_per_image
+                    keep_img = keep[start:end].clone()
+                    scores_img = scores[start:end]
+                    if per_image_min > 0 and keep_img.sum().item() < per_image_min:
+                        needed = per_image_min - int(keep_img.sum().item())
+                        scores_fill = scores_img.clone()
+                        scores_fill[keep_img] = float("-inf")
+                        _, add_idx = torch.topk(scores_fill, k=needed)
+                        keep_img[add_idx] = True
+                    if per_image_max is not None and keep_img.sum().item() > per_image_max:
+                        scores_fill = scores_img.clone()
+                        scores_fill[~keep_img] = float("-inf")
+                        _, keep_idx = torch.topk(scores_fill, k=per_image_max)
+                        new_keep_img = torch.zeros_like(keep_img, dtype=torch.bool)
+                        new_keep_img[keep_idx] = True
+                        keep_img = new_keep_img
+                    keep[start:end] = keep_img
+
+            keep_final[b] = keep
+            clipped_mask[b] = keep_pre[b] & ~keep
+
+        return keep_final, clipped_mask
+
     def _get_attn_out_proj_weight(self) -> Optional[torch.Tensor]:
         lm = self.language_model
         layer_candidates = [
@@ -1205,6 +1973,22 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             return None
         g_head = g_concat.view(B, action_tokens, num_heads, head_dim)
         g_head_norm = torch.linalg.norm(g_head, dim=-1)
+        norm_mode = str(getattr(token_cfg, "head_g_norm", "sum")).lower()
+        if norm_mode not in {"sum", "max"}:
+            norm_mode = "sum"
+        if norm_mode == "max":
+            denom = g_head_norm.max(dim=2, keepdim=True).values.clamp_min(1e-6)
+        else:
+            denom = g_head_norm.sum(dim=2, keepdim=True).clamp_min(1e-6)
+        g_tilde = g_head_norm / denom
+        if bool(getattr(token_cfg, "head_consensus_gating_enabled", False)):
+            eta = float(getattr(token_cfg, "head_consensus_eta", 1.0))
+            if eta != 1.0:
+                g_tilde = g_tilde.clamp_min(0.0).pow(eta)
+        g_beta = float(getattr(token_cfg, "head_g_beta", 1.0))
+        if g_beta != 1.0:
+            g_tilde = g_tilde.clamp_min(0.0).pow(g_beta)
+        g_head_norm = g_tilde
 
         vision_count = (
             self.vision_backbone.get_num_images_in_input()
@@ -1219,8 +2003,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             return None
 
         attn_sel = attn_weights[:, :, action_start:action_end, vision_start:vision_end]
+        attn_sel = attn_sel.float()
+        beta = float(getattr(token_cfg, "attn_score_beta", 1.0))
+        if beta != 1.0:
+            attn_sel = attn_sel.clamp_min(0.0).pow(beta)
         g_norm = g_head_norm.permute(0, 2, 1).unsqueeze(-1)
-        scores = (attn_sel.float() * g_norm).sum(dim=(1, 2))
+        scores = (attn_sel * g_norm).sum(dim=(1, 2))
         return scores
 
     def _compute_attn_only_scores(
@@ -1229,6 +2017,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_tokens: int,
         num_prompt_tokens: int,
         num_patches_with_extra: int,
+        token_cfg: TokenSelectionConfig,
     ) -> Optional[torch.Tensor]:
         if attn_weights is None or attn_weights.dim() != 4:
             return None
@@ -1243,7 +2032,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         if action_end > seq_len or vision_end > seq_len:
             return None
         attn_sel = attn_weights[:, :, action_start:action_end, vision_start:vision_end]
-        return attn_sel.float().sum(dim=(1, 2))
+        attn_sel = attn_sel.float()
+        beta = float(getattr(token_cfg, "attn_score_beta", 1.0))
+        if beta != 1.0:
+            attn_sel = attn_sel.clamp_min(0.0).pow(beta)
+        return attn_sel.sum(dim=(1, 2))
 
     def _build_overlay_labels(
         self,
@@ -1279,6 +2072,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         grad_denoise_steps: int = 0,
         timing: Optional[Dict[str, float]] = None,
         timer_device: Optional[torch.device] = None,
+        flops: Optional[Dict[str, float]] = None,
+        profile_flops: bool = False,
+        profile_flops_silent: bool = False,
     ):
         """Run diffusion-based action prediction"""
         # Clone embedding for reuse in each timestep
@@ -1331,6 +2127,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 if timer_device.type == "cuda":
                     torch.cuda.synchronize(timer_device)
                 lm_start = time.perf_counter()
+            if profile_flops and flops is not None:
+                flops["language"] = flops.get("language", 0.0) + self._estimate_llm_flops(
+                    multimodal_embeddings.shape[1], multimodal_embeddings.shape[0]
+                )
             language_model_output = self.language_model(
                 input_ids=None,
                 attention_mask=multimodal_attention_mask,
@@ -1363,6 +2163,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 if timer_device.type == "cuda":
                     torch.cuda.synchronize(timer_device)
                 head_start = time.perf_counter()
+            if profile_flops and flops is not None:
+                num_chunks = actions_hidden_states.shape[1] // ACTION_DIM
+                flops["action"] = flops.get("action", 0.0) + self._estimate_action_head_flops(
+                    action_head, num_chunks, actions_hidden_states.shape[0]
+                )
             noise_pred = action_head.predict_noise(actions_hidden_states)
             if timing is not None:
                 if timer_device.type == "cuda":
@@ -1391,6 +2196,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         return_attentions: bool = False,
         timing: Optional[Dict[str, float]] = None,
         timer_device: Optional[torch.device] = None,
+        flops: Optional[Dict[str, float]] = None,
+        profile_flops: bool = False,
+        profile_flops_silent: bool = False,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
@@ -1409,6 +2217,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             if timer_device.type == "cuda":
                 torch.cuda.synchronize(timer_device)
             lm_start = time.perf_counter()
+        if profile_flops and flops is not None:
+            flops["language"] = flops.get("language", 0.0) + self._estimate_llm_flops(
+                multimodal_embeddings.shape[1], multimodal_embeddings.shape[0]
+            )
         language_model_output = self.language_model(
             input_ids=None,
             attention_mask=multimodal_attention_mask,
@@ -1448,6 +2260,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 if timer_device.type == "cuda":
                     torch.cuda.synchronize(timer_device)
                 head_start = time.perf_counter()
+            if profile_flops and flops is not None:
+                num_chunks = actions_hidden_states.shape[1] // ACTION_DIM
+                flops["action"] = flops.get("action", 0.0) + self._estimate_action_head_flops(
+                    action_head, num_chunks, actions_hidden_states.shape[0]
+                )
             normalized_actions_tensor = action_head.predict_action(actions_hidden_states)
             if timing is not None:
                 if timer_device.type == "cuda":
@@ -1534,6 +2351,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             and token_cfg.token_selection_enabled
             and (use_diffusion or use_regression)
         )
+        profile_flops = bool(getattr(token_cfg, "flops_profile_enabled", False)) if token_cfg is not None else False
+        profile_flops_silent = (
+            bool(getattr(token_cfg, "flops_profile_silent", True)) if token_cfg is not None else True
+        )
+        flops: Optional[Dict[str, float]] = None
+        if profile_flops:
+            flops = {"vision": 0.0, "language": 0.0, "action": 0.0}
         if token_cfg is not None and token_cfg.token_selection_enabled and not (use_diffusion or use_regression):
             logger.warning(
                 "Token selection is enabled but neither diffusion nor regression is active; skipping token selection."
@@ -1579,6 +2403,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             vision_start = _timing_start()
             projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
             timing["vision"] = timing.get("vision", 0.0) + _timing_stop(vision_start)
+            if profile_flops and flops is not None:
+                flops["vision"] = flops.get("vision", 0.0) + self._estimate_vision_total_flops(
+                    projected_patch_embeddings.shape[0]
+                )
 
             # Add proprioceptive features if provided
             use_proprio = proprio_projector is not None and proprio is not None
@@ -1614,6 +2442,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     noisy_action_projector,
                     timing=timing,
                     timer_device=timer_device,
+                    flops=flops,
+                    profile_flops=profile_flops,
+                    profile_flops_silent=profile_flops_silent,
                 )
             else:
                 normalized_actions, actions_hidden_states, _ = self._regression_or_discrete_prediction(
@@ -1627,10 +2458,16 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     action_head,
                     timing=timing,
                     timer_device=timer_device,
+                    flops=flops,
+                    profile_flops=profile_flops,
+                    profile_flops_silent=profile_flops_silent,
                 )
 
             actions = self._unnormalize_actions(normalized_actions, unnorm_key)
+            if flops is not None:
+                flops["total"] = float(flops.get("vision", 0.0) + flops.get("language", 0.0) + flops.get("action", 0.0))
             self._token_selection_state["last_timing"] = timing
+            self._token_selection_state["last_flops"] = flops
             if return_token_selection:
                 return actions, actions_hidden_states, None
             return actions, actions_hidden_states
@@ -1667,6 +2504,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             use_partial_grad = False
             use_attn_only = False
         use_full_grad = eval_frame and not (use_partial_grad or use_attn_only)
+        reuse_mode = str(getattr(token_cfg, "token_reuse_mode", "none")).lower()
+        if reuse_mode not in {"none", "reuse_kv", "reuse_all"}:
+            reuse_mode = "none"
 
         with torch.set_grad_enabled(use_full_grad):
             # Prepare inputs by adding necessary tokens
@@ -1688,6 +2528,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             vision_start = _timing_start()
             image_embs_new = self._process_vision_features(pixel_values, language_embeddings, use_film)
             timing["vision"] = timing.get("vision", 0.0) + _timing_stop(vision_start)
+            if profile_flops and flops is not None:
+                flops["vision"] = flops.get("vision", 0.0) + self._estimate_vision_total_flops(
+                    image_embs_new.shape[0]
+                )
             image_embs = image_embs_new
             if (
                 token_cfg.vision_partial_update_enabled
@@ -1708,34 +2552,42 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             if use_full_grad:
                 image_embs.requires_grad_(True)
 
-            background_mask = self._compute_background_mask(
+            background_region_mask = self._compute_background_region_mask(
                 image_embs.detach(),
                 state["last_image_embs"],
                 token_cfg.token_temporal_threshold,
                 token_cfg.token_spatial_threshold,
                 token_cfg.token_spatial_radius,
+                token_cfg.region_patch_size,
             )
+            background_mask = self._expand_region_mask(background_region_mask, token_cfg.region_patch_size)
 
             if not eval_frame:
-                important_mask = state["last_important_mask"]
-                if important_mask is None:
-                    important_mask = torch.zeros_like(background_mask, dtype=torch.bool)
+                important_region_mask = state.get("last_important_region_mask")
+                if important_region_mask is None:
+                    important_region_mask = torch.zeros_like(background_region_mask, dtype=torch.bool)
                 token_scores = state["last_token_scores"]
                 if token_scores is None:
                     token_scores = torch.linalg.norm(image_embs.detach().float(), dim=-1)
                     state["last_token_scores"] = token_scores.detach()
+                region_scores = self._compute_region_scores(token_scores, token_cfg.region_patch_size)
 
-                keep_pre = (~background_mask) | important_mask
-                keep_final, clipped_mask = self._apply_keep_constraints(
-                    keep_pre,
-                    token_scores,
+                keep_pre_region = (~background_region_mask) | important_region_mask
+                keep_region_final, clipped_region_mask = self._apply_keep_constraints_regions(
+                    keep_pre_region,
+                    region_scores,
                     token_cfg.min_kept_tokens,
                     token_cfg.max_kept_tokens,
+                    token_cfg.region_patch_size,
                 )
+                important_mask = self._expand_region_mask(important_region_mask, token_cfg.region_patch_size)
+                keep_pre = self._expand_region_mask(keep_pre_region, token_cfg.region_patch_size)
+                keep_final = self._expand_region_mask(keep_region_final, token_cfg.region_patch_size)
+                clipped_mask = self._expand_region_mask(clipped_region_mask, token_cfg.region_patch_size)
                 effective_important_mask = important_mask & keep_final
                 overlay = self._build_overlay_labels(keep_final, important_mask, clipped_mask)
 
-                if token_cfg.token_prune_enabled:
+                if token_cfg.token_prune_enabled and reuse_mode == "none":
                     if image_embs.shape[0] != 1:
                         raise ValueError("Token pruning only supports batch size 1.")
                     kept_indices = torch.where(keep_final[0])[0]
@@ -1761,6 +2613,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                         device=input_embeddings.device,
                         dtype=input_embeddings.dtype,
                     )
+                    if reuse_mode != "none":
+                        reuse_mask_full = self._build_llm_reuse_mask(
+                            keep_final, projected_patch_embeddings.shape[1], input_embeddings
+                        )
+                        self._set_llm_reuse_context(reuse_mask_full, reuse_mode, force=True)
                     normalized_actions, actions_hidden_states, _ = self._run_diffusion_prediction(
                         input_embeddings,
                         all_actions_mask,
@@ -1774,9 +2631,19 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                         noisy_action_projector,
                         timing=timing,
                         timer_device=timer_device,
+                        flops=flops,
+                        profile_flops=profile_flops,
+                        profile_flops_silent=profile_flops_silent,
                     )
+                    if reuse_mode != "none":
+                        self._clear_llm_reuse_context()
                 else:
                     NUM_PATCHES = projected_patch_embeddings.shape[1]
+                    if reuse_mode != "none":
+                        reuse_mask_full = self._build_llm_reuse_mask(
+                            keep_final, projected_patch_embeddings.shape[1], input_embeddings
+                        )
+                        self._set_llm_reuse_context(reuse_mask_full, reuse_mode, force=True)
                     normalized_actions, actions_hidden_states, _ = self._regression_or_discrete_prediction(
                         input_embeddings,
                         all_actions_mask,
@@ -1788,7 +2655,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                         action_head,
                         timing=timing,
                         timer_device=timer_device,
+                        flops=flops,
+                        profile_flops=profile_flops,
+                        profile_flops_silent=profile_flops_silent,
                     )
+                    if reuse_mode != "none":
+                        self._clear_llm_reuse_context()
 
             else:
                 use_proprio = proprio_projector is not None and proprio is not None
@@ -1810,6 +2682,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                         device=input_embeddings.device,
                         dtype=input_embeddings.dtype,
                     )
+                    if reuse_mode != "none":
+                        self._set_llm_reuse_context(None, reuse_mode, force=True)
                     normalized_actions, actions_hidden_states, noise_preds = self._run_diffusion_prediction(
                         input_embeddings,
                         all_actions_mask,
@@ -1825,10 +2699,17 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                         grad_denoise_steps=token_cfg.grad_denoise_steps,
                         timing=timing,
                         timer_device=timer_device,
+                        flops=flops,
+                        profile_flops=profile_flops,
+                        profile_flops_silent=profile_flops_silent,
                     )
+                    if reuse_mode != "none":
+                        self._clear_llm_reuse_context()
                 else:
                     NUM_PATCHES = projected_patch_embeddings.shape[1]
                     if use_partial_grad:
+                        if reuse_mode != "none":
+                            self._set_llm_reuse_context(None, reuse_mode, force=True)
                         (
                             normalized_actions,
                             actions_hidden_states,
@@ -1847,8 +2728,15 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                             return_attentions=True,
                             timing=timing,
                             timer_device=timer_device,
+                            flops=flops,
+                            profile_flops=profile_flops,
+                            profile_flops_silent=profile_flops_silent,
                         )
+                        if reuse_mode != "none":
+                            self._clear_llm_reuse_context()
                     elif use_attn_only:
+                        if reuse_mode != "none":
+                            self._set_llm_reuse_context(None, reuse_mode, force=True)
                         (
                             normalized_actions,
                             actions_hidden_states,
@@ -1867,8 +2755,15 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                             return_attentions=True,
                             timing=timing,
                             timer_device=timer_device,
+                            flops=flops,
+                            profile_flops=profile_flops,
+                            profile_flops_silent=profile_flops_silent,
                         )
+                        if reuse_mode != "none":
+                            self._clear_llm_reuse_context()
                     else:
+                        if reuse_mode != "none":
+                            self._set_llm_reuse_context(None, reuse_mode, force=True)
                         normalized_actions, actions_hidden_states, normalized_actions_tensor = (
                             self._regression_or_discrete_prediction(
                                 input_embeddings,
@@ -1882,8 +2777,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                                 return_actions_tensor=True,
                                 timing=timing,
                                 timer_device=timer_device,
+                                flops=flops,
+                                profile_flops=profile_flops,
+                                profile_flops_silent=profile_flops_silent,
                             )
                         )
+                        if reuse_mode != "none":
+                            self._clear_llm_reuse_context()
                     if normalized_actions_tensor is None:
                         raise ValueError("Token selection requires regression action head when diffusion is disabled.")
 
@@ -1912,6 +2812,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                         actions_hidden_states.shape[1],
                         NUM_PROMPT_TOKENS,
                         NUM_PATCHES,
+                        token_cfg,
                     )
                     if token_scores is None:
                         token_scores = torch.linalg.norm(image_embs.detach().float(), dim=-1)
@@ -1968,17 +2869,24 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                         ) * region_scores
 
                 mass = float(min(max(token_cfg.grad_region_mass, 0.0), 1.0))
-                important_mask = self._select_important_mask(region_scores, mass, token_cfg.region_patch_size)
-                if token_cfg.grad_keep_prev and state["last_important_mask"] is not None:
-                    important_mask = important_mask | state["last_important_mask"]
+                important_region_mask = self._select_important_mask(
+                    region_scores, mass, token_cfg.region_patch_size, return_region_mask=True
+                )
+                if token_cfg.grad_keep_prev and state.get("last_important_region_mask") is not None:
+                    important_region_mask = important_region_mask | state["last_important_region_mask"]
 
-                keep_pre = (~background_mask) | important_mask
-                keep_final, clipped_mask = self._apply_keep_constraints(
-                    keep_pre,
-                    token_scores,
+                keep_pre_region = (~background_region_mask) | important_region_mask
+                keep_region_final, clipped_region_mask = self._apply_keep_constraints_regions(
+                    keep_pre_region,
+                    region_scores,
                     token_cfg.min_kept_tokens,
                     token_cfg.max_kept_tokens,
+                    token_cfg.region_patch_size,
                 )
+                important_mask = self._expand_region_mask(important_region_mask, token_cfg.region_patch_size)
+                keep_pre = self._expand_region_mask(keep_pre_region, token_cfg.region_patch_size)
+                keep_final = self._expand_region_mask(keep_region_final, token_cfg.region_patch_size)
+                clipped_mask = self._expand_region_mask(clipped_region_mask, token_cfg.region_patch_size)
                 effective_important_mask = important_mask & keep_final
                 overlay = self._build_overlay_labels(keep_final, important_mask, clipped_mask)
                 timing["eval"] = timing.get("eval", 0.0) + _timing_stop(eval_start)
@@ -1986,6 +2894,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 state["last_token_scores"] = token_scores.detach()
                 state["last_region_scores"] = region_scores.detach()
                 state["last_important_mask"] = important_mask.detach()
+                state["last_important_region_mask"] = important_region_mask.detach()
                 state["last_gate"] = gate
                 state["last_lambda_pos"] = lambda_pos
                 state["last_lambda_grip"] = lambda_grip
@@ -1998,6 +2907,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             state["last_effective_important_mask"] = effective_important_mask.detach()
             state["last_overlay_labels"] = overlay.detach()
             state["last_timing"] = timing
+            if flops is not None:
+                flops["total"] = float(
+                    flops.get("vision", 0.0) + flops.get("language", 0.0) + flops.get("action", 0.0)
+                )
+            state["last_flops"] = flops
 
             num_images = self.vision_backbone.get_num_images_in_input()
             num_patches = self.vision_backbone.get_num_patches()

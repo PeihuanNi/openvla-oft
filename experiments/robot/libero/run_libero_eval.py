@@ -117,6 +117,8 @@ class GenerateConfig:
     token_selection_enabled: bool = True             # Enable gradient-based token selection
     token_prune_enabled: bool = False                # Enable LLM token pruning on non-eval frames
     vision_partial_update_enabled: bool = False      # Enable partial vision token updates (cache reuse)
+    flops_profile_enabled: bool = False              # Enable FLOPs estimate (theoretical, per-forward)
+    flops_profile_silent: bool = True                # No-op for estimate mode
     region_eval_interval: int = 1                    # Evaluate token importance every N frames
     grad_denoise_steps: int = 1                      # Use last N denoise steps for gradient objective
     grad_region_mass: float = 0.70                   # Mass threshold for region selection (normalized)
@@ -126,6 +128,12 @@ class GenerateConfig:
     partial_grad_phi: str = "l2"                     # "l2" or "l1"
     partial_grad_pos_weight: float = 1.0             # Pos dims weight for partial grad
     partial_grad_grip_weight: float = 2.0            # Grip dim weight for partial grad
+    attn_score_beta: float = 1.0                     # Exponent for attention-based scoring (beta > 0)
+    head_consensus_gating_enabled: bool = False      # Enable head-consensus gating in partial-grad scoring
+    head_consensus_eta: float = 1.0                  # Exponent for head-consensus gating (eta > 0)
+    head_g_beta: float = 1.0                         # Exponent for head magnitude in partial-grad (beta > 0)
+    head_g_norm: str = "sum"                         # Head g normalization across heads: sum or max
+    token_reuse_mode: str = "none"                   # "none", "reuse_kv", or "reuse_all"
     grad_tau: float = 0.1                            # Gripper change scale for adaptive weighting
     grad_alpha: float = 1.0                          # Gripper weight scale
     grad_beta: float = 1.0                           # Position weight scale
@@ -151,6 +159,8 @@ class GenerateConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
     rollout_dir: str = "./rollouts"                  # Base directory for rollout MP4s
+    overlay_show_scores: bool = True                 # Whether to draw region scores on overlays
+    overlay_show_ids: bool = False                   # Whether to draw region IDs on overlays
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
@@ -192,6 +202,26 @@ def validate_config(cfg: GenerateConfig) -> None:
         if score_method == "partial_grad":
             phi = str(cfg.partial_grad_phi).lower()
             assert phi in {"l1", "l2"}, "partial_grad_phi must be 'l1' or 'l2'."
+        attn_beta = float(getattr(cfg, "attn_score_beta", 1.0))
+        assert attn_beta > 0.0, "attn_score_beta must be > 0."
+        head_consensus = bool(getattr(cfg, "head_consensus_gating_enabled", False))
+        if head_consensus:
+            assert score_method == "partial_grad", "head-consensus gating requires partial_grad scoring."
+            head_eta = float(getattr(cfg, "head_consensus_eta", 1.0))
+            assert head_eta > 0.0, "head_consensus_eta must be > 0."
+        head_g_beta = float(getattr(cfg, "head_g_beta", 1.0))
+        assert head_g_beta > 0.0, "head_g_beta must be > 0."
+        if score_method == "partial_grad":
+            head_g_norm = str(getattr(cfg, "head_g_norm", "sum")).lower()
+            assert head_g_norm in {"sum", "max"}, "head_g_norm must be 'sum' or 'max'."
+        reuse_mode = str(cfg.token_reuse_mode).lower()
+        assert reuse_mode in {"none", "reuse_kv", "reuse_all"}, (
+            "token_reuse_mode must be one of: none, reuse_kv, reuse_all."
+        )
+        if reuse_mode != "none":
+            assert cfg.use_l1_regression and not cfg.use_diffusion, (
+                "token_reuse_mode requires L1 regression and does not support diffusion."
+            )
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -322,6 +352,9 @@ def _extract_overlay_state(model, cfg):
     if overlay_grid is None:
         return None, None
 
+    show_scores = bool(getattr(cfg, "overlay_show_scores", True))
+    show_ids = bool(getattr(cfg, "overlay_show_ids", False))
+
     if torch.is_tensor(overlay_grid):
         overlay_grid = overlay_grid.detach().cpu().numpy()
     overlay_grid = overlay_grid.astype(np.uint8)
@@ -342,24 +375,26 @@ def _extract_overlay_state(model, cfg):
         token_scores = token_scores[:tokens_per_image]
         token_scores = token_scores.reshape(overlay_grid.shape)
 
-    region_scores = state.get("last_region_scores")
-    if region_scores is not None:
-        if torch.is_tensor(region_scores):
-            region_scores = region_scores.detach().cpu().numpy()
-        if region_scores.ndim == 4:
-            region_scores = region_scores[0, 0]
-        elif region_scores.ndim == 3:
-            region_scores = region_scores[0]
-    elif token_scores is not None and region_patch > 1:
-        if (
-            overlay_grid.shape[0] % region_patch == 0
-            and overlay_grid.shape[1] % region_patch == 0
-        ):
-            region_h = overlay_grid.shape[0] // region_patch
-            region_w = overlay_grid.shape[1] // region_patch
-            region_scores = token_scores.reshape(
-                region_h, region_patch, region_w, region_patch
-            ).mean(axis=(1, 3))
+    region_scores = None
+    if show_scores:
+        region_scores = state.get("last_region_scores")
+        if region_scores is not None:
+            if torch.is_tensor(region_scores):
+                region_scores = region_scores.detach().cpu().numpy()
+            if region_scores.ndim == 4:
+                region_scores = region_scores[0, 0]
+            elif region_scores.ndim == 3:
+                region_scores = region_scores[0]
+        elif token_scores is not None and region_patch > 1:
+            if (
+                overlay_grid.shape[0] % region_patch == 0
+                and overlay_grid.shape[1] % region_patch == 0
+            ):
+                region_h = overlay_grid.shape[0] // region_patch
+                region_w = overlay_grid.shape[1] // region_patch
+                region_scores = token_scores.reshape(
+                    region_h, region_patch, region_w, region_patch
+                ).mean(axis=(1, 3))
 
     if region_patch > 1:
         if overlay_grid.shape[0] % region_patch == 0 and overlay_grid.shape[1] % region_patch == 0:
@@ -386,7 +421,76 @@ def _extract_overlay_state(model, cfg):
     return overlay_grid, region_scores
 
 
-def _apply_overlay(img, overlay_grid, region_scores=None, alpha=0.35):
+def _extract_region_scores_for_plot(model, cfg):
+    if not hasattr(model, "get_token_selection_state"):
+        return None
+
+    state = model.get_token_selection_state()
+    if state is None:
+        return None
+
+    def _to_numpy(value):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            value = value.detach().cpu().numpy()
+        return np.array(value)
+
+    overlay_grid = _to_numpy(state.get("last_overlay_grid"))
+    if overlay_grid is not None:
+        if overlay_grid.ndim == 4:
+            overlay_grid = overlay_grid[0, 0]
+        elif overlay_grid.ndim == 3:
+            overlay_grid = overlay_grid[0]
+
+    grid_h = overlay_grid.shape[0] if overlay_grid is not None else None
+    grid_w = overlay_grid.shape[1] if overlay_grid is not None else None
+    region_patch = max(1, int(cfg.region_patch_size))
+
+    region_scores = _to_numpy(state.get("last_region_scores"))
+    if region_scores is not None:
+        if region_scores.ndim == 4:
+            region_scores = region_scores[0, 0]
+        elif region_scores.ndim == 3:
+            region_scores = region_scores[0]
+        elif region_scores.ndim == 2 and region_scores.shape[0] == 1:
+            region_scores = region_scores[0]
+
+        if region_scores.ndim == 1 and grid_h is not None and grid_w is not None:
+            if (grid_h % region_patch) != 0 or (grid_w % region_patch) != 0:
+                return None
+            region_h = grid_h // region_patch
+            region_w = grid_w // region_patch
+            if region_scores.size == region_h * region_w:
+                region_scores = region_scores.reshape(region_h, region_w)
+
+        if region_scores.ndim == 2:
+            return region_scores.astype(np.float32)
+
+    token_scores = _to_numpy(state.get("last_token_scores"))
+    if token_scores is None or overlay_grid is None:
+        return None
+
+    if token_scores.ndim == 2:
+        token_scores = token_scores[0]
+    tokens_per_image = grid_h * grid_w
+    if tokens_per_image <= 0:
+        return None
+    if token_scores.size < tokens_per_image:
+        return None
+    token_scores = token_scores[:tokens_per_image]
+    scores_grid = token_scores.reshape(grid_h, grid_w)
+    if region_patch == 1:
+        return scores_grid.astype(np.float32)
+    if (grid_h % region_patch) != 0 or (grid_w % region_patch) != 0:
+        return None
+    region_h = grid_h // region_patch
+    region_w = grid_w // region_patch
+    region_scores = scores_grid.reshape(region_h, region_patch, region_w, region_patch).mean(axis=(1, 3))
+    return region_scores.astype(np.float32)
+
+
+def _apply_overlay(img, overlay_grid, region_scores=None, alpha=0.35, show_ids=False):
     if overlay_grid is None:
         return img
 
@@ -406,44 +510,111 @@ def _apply_overlay(img, overlay_grid, region_scores=None, alpha=0.35):
         np.uint8
     )
 
-    if region_scores is None:
+    show_scores = region_scores is not None
+    if not show_scores and not show_ids:
         return blended
 
     if torch.is_tensor(region_scores):
         region_scores = region_scores.detach().cpu().numpy()
 
-    region_scores = region_scores.astype(np.float32)
-    total = float(region_scores.sum())
-    if total > 0:
-        region_scores = region_scores / total
-
-    region_h, region_w = region_scores.shape
+    region_h, region_w = overlay_grid.shape
     cell_w = width / max(region_w, 1)
     cell_h = height / max(region_h, 1)
 
+    if show_scores:
+        region_scores = region_scores.astype(np.float32)
+        total = float(region_scores.sum())
+        if total > 0:
+            region_scores = region_scores / total
+
     pil_img = Image.fromarray(blended)
     draw = ImageDraw.Draw(pil_img)
-    font_size = max(7, min(10, int(min(cell_w, cell_h) * 0.4)))
-    font = None
-    for font_name in ("DejaVuSansMono.ttf", "DejaVuSans.ttf", "Arial.ttf"):
-        try:
-            font = ImageFont.truetype(font_name, size=font_size)
-            break
-        except OSError:
-            font = None
-    if font is None:
-        font = ImageFont.load_default()
+    id_font_size = max(10, min(16, int(min(cell_w, cell_h) * 0.55)))
+    score_font_size = max(7, min(12, int(min(cell_w, cell_h) * 0.38)))
+
+    def _load_font(size):
+        for font_name in ("DejaVuSansMono.ttf", "DejaVuSans.ttf", "Arial.ttf"):
+            try:
+                return ImageFont.truetype(font_name, size=size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    id_font = _load_font(id_font_size)
+    score_font = _load_font(score_font_size)
 
     for r in range(region_h):
         for c in range(region_w):
-            score = region_scores[r, c]
-            text = f"{score:.3f}"
             x = int((c + 0.03) * cell_w)
             y = int((r + 0.03) * cell_h)
-            draw.text((x + 1, y + 1), text, fill=(0, 0, 0), font=font)
-            draw.text((x, y), text, fill=(255, 255, 255), font=font)
+            if show_ids:
+                region_id = r * region_w + c
+                id_text = str(region_id)
+                draw.text((x + 1, y + 1), id_text, fill=(0, 0, 0), font=id_font)
+                draw.text((x, y), id_text, fill=(255, 255, 255), font=id_font)
+                y = y + int(id_font_size * 0.85)
+            if show_scores:
+                score = region_scores[r, c]
+                text = f"{score:.3f}"
+                draw.text((x + 1, y + 1), text, fill=(0, 0, 0), font=score_font)
+                draw.text((x, y), text, fill=(255, 255, 255), font=score_font)
 
     return np.array(pil_img)
+
+
+def save_region_score_plot(region_scores_history, mp4_path, log_file=None):
+    if not region_scores_history:
+        log_message("Region score plot skipped (no region scores collected).", log_file)
+        return None
+
+    scores = np.stack(region_scores_history, axis=0)
+    if scores.ndim != 3:
+        log_message("Region score plot skipped (unexpected score shape).", log_file)
+        return None
+
+    num_steps, region_h, region_w = scores.shape
+    num_regions = region_h * region_w
+    scores_flat = scores.reshape(num_steps, num_regions)
+
+    row_sums = scores_flat.sum(axis=1, keepdims=True)
+    nonzero = row_sums > 0
+    scores_flat = np.where(nonzero, scores_flat / row_sums, scores_flat)
+
+    fig_w = max(14.0, min(60.0, 16.0 + num_regions / 18.0))
+    fig_h = max(8.0, min(36.0, 8.0 + num_regions / 40.0))
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(fig_w, fig_h), dpi=120)
+    x = np.arange(1, num_steps + 1)
+    colors = plt.cm.viridis(np.linspace(0.0, 0.8, num_regions))
+    y_max = 0.15
+    for idx in range(num_regions):
+        plt.plot(x, scores_flat[:, idx], color=colors[idx], linewidth=0.6, alpha=0.7)
+        label_y = min(float(scores_flat[-1, idx]), y_max)
+        plt.text(
+            num_steps + 0.5,
+            label_y,
+            str(idx),
+            color=colors[idx],
+            fontsize=8,
+            alpha=0.85,
+            va="center",
+        )
+    plt.xlabel("forward_step")
+    plt.ylabel("score")
+    plt.title(f"Region score trajectories (regions={num_regions}, id=row-major)")
+    plt.ylim(0.0, y_max)
+    plt.xlim(1, num_steps + 1.5)
+    plt.tight_layout()
+
+    plot_path = str(mp4_path).replace(".mp4", "--region_scores.png")
+    plt.savefig(plot_path)
+    plt.close()
+    log_message(f"Saved region score plot at path {plot_path}", log_file)
+    return plot_path
 
 
 def _init_forward_stats():
@@ -451,7 +622,17 @@ def _init_forward_stats():
         "total_calls": 0,
         "total_time": 0.0,
         "total_steps": 0,
-        "base": {"count": 0, "total": 0.0, "vision": 0.0, "language": 0.0, "action": 0.0},
+        "base": {
+            "count": 0,
+            "total": 0.0,
+            "vision": 0.0,
+            "language": 0.0,
+            "action": 0.0,
+            "flops_total": 0.0,
+            "flops_vision": 0.0,
+            "flops_language": 0.0,
+            "flops_action": 0.0,
+        },
         "eval": {
             "count": 0,
             "total": 0.0,
@@ -461,6 +642,10 @@ def _init_forward_stats():
             "eval": 0.0,
             "important_ratio": 0.0,
             "ratio_count": 0,
+            "flops_total": 0.0,
+            "flops_vision": 0.0,
+            "flops_language": 0.0,
+            "flops_action": 0.0,
         },
         "prune": {
             "count": 0,
@@ -472,6 +657,10 @@ def _init_forward_stats():
             "important_ratio": 0.0,
             "background_ratio": 0.0,
             "ratio_count": 0,
+            "flops_total": 0.0,
+            "flops_vision": 0.0,
+            "flops_language": 0.0,
+            "flops_action": 0.0,
         },
     }
 
@@ -495,6 +684,7 @@ def _update_forward_stats(stats, model, cfg, total_time):
     if not isinstance(state, dict):
         return
     timing = state.get("last_timing") or {}
+    flops = state.get("last_flops") if isinstance(state.get("last_flops"), dict) else None
     if not cfg.token_selection_enabled:
         base = stats["base"]
         base["count"] += 1
@@ -502,6 +692,11 @@ def _update_forward_stats(stats, model, cfg, total_time):
         base["vision"] += float(timing.get("vision", 0.0))
         base["language"] += float(timing.get("language", 0.0))
         base["action"] += float(timing.get("action", 0.0))
+        if flops is not None:
+            base["flops_total"] += float(flops.get("total", 0.0))
+            base["flops_vision"] += float(flops.get("vision", 0.0))
+            base["flops_language"] += float(flops.get("language", 0.0))
+            base["flops_action"] += float(flops.get("action", 0.0))
         return
 
     eval_frame = bool(state.get("last_eval_frame", False))
@@ -511,6 +706,11 @@ def _update_forward_stats(stats, model, cfg, total_time):
     bucket["vision"] += float(timing.get("vision", 0.0))
     bucket["language"] += float(timing.get("language", 0.0))
     bucket["action"] += float(timing.get("action", 0.0))
+    if flops is not None:
+        bucket["flops_total"] += float(flops.get("total", 0.0))
+        bucket["flops_vision"] += float(flops.get("vision", 0.0))
+        bucket["flops_language"] += float(flops.get("language", 0.0))
+        bucket["flops_action"] += float(flops.get("action", 0.0))
     if eval_frame:
         bucket["eval"] += float(timing.get("eval", 0.0))
 
@@ -554,6 +754,9 @@ def _format_forward_stats(stats):
     def _fmt_pct(value):
         return f"{value * 100:5.1f}%"
 
+    def _fmt_tflops(value):
+        return f"{value / 1e12:6.3f} T"
+
     def _pad(label, value, width):
         return f"{label} {value}".ljust(width)
 
@@ -571,6 +774,19 @@ def _format_forward_stats(stats):
                 ]
             )
         )
+        if base_stats.get("flops_total", 0.0) > 0.0:
+            lines.append(
+                "总体FLOPS均值: "
+                + " | ".join(
+                    [
+                        _pad("总", _fmt_tflops(base_stats["flops_total"] / base_stats["count"]), 10),
+                        _pad("视觉", _fmt_tflops(base_stats["flops_vision"] / base_stats["count"]), 10),
+                        _pad("语言", _fmt_tflops(base_stats["flops_language"] / base_stats["count"]), 10),
+                        _pad("L1头", _fmt_tflops(base_stats["flops_action"] / base_stats["count"]), 10),
+                        f"运行数={base_stats['count']}",
+                    ]
+                )
+            )
 
     eval_stats = stats["eval"]
     if eval_stats["count"] > 0:
@@ -599,6 +815,19 @@ def _format_forward_stats(stats):
                 ]
             )
         )
+        if eval_stats.get("flops_total", 0.0) > 0.0:
+            lines.append(
+                "评估FLOPS均值: "
+                + " | ".join(
+                    [
+                        _pad("总", _fmt_tflops(eval_stats["flops_total"] / eval_stats["count"]), 10),
+                        _pad("视觉", _fmt_tflops(eval_stats["flops_vision"] / eval_stats["count"]), 10),
+                        _pad("语言", _fmt_tflops(eval_stats["flops_language"] / eval_stats["count"]), 10),
+                        _pad("L1头", _fmt_tflops(eval_stats["flops_action"] / eval_stats["count"]), 10),
+                        f"评估运行数={eval_stats['count']}",
+                    ]
+                )
+            )
 
     prune_stats = stats["prune"]
     if prune_stats["count"] > 0:
@@ -627,6 +856,57 @@ def _format_forward_stats(stats):
                 ]
             )
         )
+        if prune_stats.get("flops_total", 0.0) > 0.0:
+            lines.append(
+                "剪枝FLOPS均值: "
+                + " | ".join(
+                    [
+                        _pad("总", _fmt_tflops(prune_stats["flops_total"] / prune_stats["count"]), 10),
+                        _pad("视觉", _fmt_tflops(prune_stats["flops_vision"] / prune_stats["count"]), 10),
+                        _pad("语言", _fmt_tflops(prune_stats["flops_language"] / prune_stats["count"]), 10),
+                        _pad("L1头", _fmt_tflops(prune_stats["flops_action"] / prune_stats["count"]), 10),
+                        f"剪枝运行数={prune_stats['count']}",
+                    ]
+                )
+            )
+
+    if base_stats["count"] == 0:
+        total_count = eval_stats["count"] + prune_stats["count"]
+        total_flops = eval_stats.get("flops_total", 0.0) + prune_stats.get("flops_total", 0.0)
+        if total_count > 0 and total_flops > 0.0:
+            lines.append(
+                "总体FLOPS均值: "
+                + " | ".join(
+                    [
+                        _pad("总", _fmt_tflops(total_flops / total_count), 10),
+                        _pad(
+                            "视觉",
+                            _fmt_tflops(
+                                (eval_stats.get("flops_vision", 0.0) + prune_stats.get("flops_vision", 0.0))
+                                / total_count
+                            ),
+                            10,
+                        ),
+                        _pad(
+                            "语言",
+                            _fmt_tflops(
+                                (eval_stats.get("flops_language", 0.0) + prune_stats.get("flops_language", 0.0))
+                                / total_count
+                            ),
+                            10,
+                        ),
+                        _pad(
+                            "L1头",
+                            _fmt_tflops(
+                                (eval_stats.get("flops_action", 0.0) + prune_stats.get("flops_action", 0.0))
+                                / total_count
+                            ),
+                            10,
+                        ),
+                        f"运行数={total_count}",
+                    ]
+                )
+            )
     return lines
 
 
@@ -681,8 +961,13 @@ def run_episode(
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
     last_overlay_grid = None
     last_region_scores = None
+    show_scores = bool(getattr(cfg, "overlay_show_scores", True))
+    show_ids = bool(getattr(cfg, "overlay_show_ids", False))
     forward_stats = _init_forward_stats()
     steps_executed = 0
+    region_scores_history = []
+    last_region_scores_for_plot = None
+    region_scores_shape = None
 
     # Run episode
     success = False
@@ -698,7 +983,14 @@ def run_episode(
             # Prepare observation
             observation, img = prepare_observation(obs, resize_size)
             if cfg.token_selection_enabled and last_overlay_grid is not None:
-                replay_images.append(_apply_overlay(img, last_overlay_grid, last_region_scores))
+                replay_images.append(
+                    _apply_overlay(
+                        img,
+                        last_overlay_grid,
+                        last_region_scores if show_scores else None,
+                        show_ids=show_ids,
+                    )
+                )
             else:
                 replay_images.append(img)
 
@@ -728,8 +1020,28 @@ def run_episode(
                     overlay_grid, region_scores = _extract_overlay_state(model, cfg)
                     if overlay_grid is not None:
                         last_overlay_grid = overlay_grid
-                        last_region_scores = region_scores
-                        replay_images[-1] = _apply_overlay(img, last_overlay_grid, last_region_scores)
+                        last_region_scores = region_scores if show_scores else None
+                        replay_images[-1] = _apply_overlay(
+                            img,
+                            last_overlay_grid,
+                            last_region_scores if show_scores else None,
+                            show_ids=show_ids,
+                        )
+                    plot_scores = _extract_region_scores_for_plot(model, cfg)
+                    if plot_scores is None:
+                        plot_scores = last_region_scores_for_plot
+                    if plot_scores is not None:
+                        if region_scores_shape is None:
+                            region_scores_shape = plot_scores.shape
+                        if plot_scores.shape == region_scores_shape:
+                            region_scores_history.append(plot_scores)
+                            last_region_scores_for_plot = plot_scores
+                        else:
+                            log_message(
+                                f"Skipping region score snapshot (shape changed from {region_scores_shape} "
+                                f"to {plot_scores.shape}).",
+                                log_file,
+                            )
 
             # Get action from queue
             action = action_queue.popleft()
@@ -749,7 +1061,7 @@ def run_episode(
         log_message(f"Episode error: {e}", log_file)
 
     forward_stats["total_steps"] = steps_executed
-    return success, replay_images, forward_stats
+    return success, replay_images, forward_stats, region_scores_history
 
 
 def run_task(
@@ -801,7 +1113,7 @@ def run_task(
         log_message(f"Starting episode {task_episodes + 1}...", log_file)
 
         # Run episode
-        success, replay_images, forward_stats = run_episode(
+        success, replay_images, forward_stats, region_scores_history = run_episode(
             cfg,
             env,
             task_description,
@@ -823,7 +1135,7 @@ def run_task(
             total_successes += 1
 
         # Save replay video
-        save_rollout_video(
+        mp4_path = save_rollout_video(
             replay_images,
             total_episodes,
             success=success,
@@ -831,6 +1143,8 @@ def run_task(
             rollout_dir=cfg.rollout_dir,
             log_file=log_file,
         )
+        if cfg.token_selection_enabled:
+            save_region_score_plot(region_scores_history, mp4_path, log_file)
 
         # Log results
         log_message(f"Success: {success}", log_file)
