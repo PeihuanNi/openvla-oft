@@ -741,10 +741,17 @@ def get_vla_action(
         List[np.ndarray]: Predicted actions
     """
     with torch.inference_mode():
+        effective_num_images = getattr(cfg, "_dyn_num_images", cfg.num_images_in_input)
+
+        try:
+            if hasattr(vla, "vision_backbone") and hasattr(vla.vision_backbone, "set_num_images_in_input"):
+                vla.vision_backbone.set_num_images_in_input(int(effective_num_images))
+        except Exception:
+            pass
 
         # Collect all input images
         all_images = [obs["full_image"]]
-        if cfg.num_images_in_input > 1:
+        if effective_num_images > 1:
             all_images.extend([obs[k] for k in obs.keys() if "wrist" in k])
 
         # Process images
@@ -777,10 +784,36 @@ def get_vla_action(
             obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
             proprio = obs["state"]
 
+        qk_keep_config = None
+        try:
+            if getattr(cfg, "qk_keep_enabled", False) or getattr(cfg, "visualize_pruning", False):
+                qk_keep_split = getattr(cfg, "qk_keep_split", None)
+                if isinstance(qk_keep_split, str):
+                    try:
+                        qk_keep_split = [float(x) for x in qk_keep_split.split(",")]
+                    except Exception:
+                        qk_keep_split = None
+                qk_keep_config = {
+                    "qk_keep_enabled": bool(getattr(cfg, "qk_keep_enabled", False)),
+                    "qk_layer": int(getattr(cfg, "qk_layer", 0)),
+                    "qk_keep_ratio": float(getattr(cfg, "qk_keep_ratio", 0.5)),
+                    "qk_keep_split": qk_keep_split,
+                    "qk_debug": bool(getattr(cfg, "qk_debug", False)),
+                    "qk_log_topk": int(getattr(cfg, "qk_log_topk", 16)),
+                    "qk_visualize": bool(getattr(cfg, "visualize_pruning", False)),
+                }
+        except Exception:
+            qk_keep_config = None
+
         # Generate action
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
-            action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
+            action, _ = vla.predict_action(
+                **inputs,
+                unnorm_key=cfg.unnorm_key,
+                do_sample=False,
+                qk_keep_config=qk_keep_config,
+            )
         else:
             # Custom action head for continuous actions
             action, _ = vla.predict_action(
@@ -792,6 +825,7 @@ def get_vla_action(
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
                 use_film=use_film,
+                qk_keep_config=qk_keep_config,
             )
 
     # Return action chunk as list of actions

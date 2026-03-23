@@ -24,6 +24,14 @@ import wandb
 
 # Append current directory so that interpreter can find experiments.robot
 sys.path.append("../..")
+from experiments.robot.libero.adp_utils import (
+    ActionAwarePruningController,
+    load_adp_config_from_json,
+)
+from experiments.robot.libero.overlay_utils import (
+    get_adp_overlay_state,
+    render_adp_overlay,
+)
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
     get_libero_env,
@@ -106,6 +114,13 @@ class GenerateConfig:
 
     load_in_8bit: bool = False                       # (For OpenVLA only) Load with 8-bit quantization
     load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
+    qk_config_json: Optional[str] = None             # Optional JSON file for ADP/QK pruning parameters
+    qk_keep_enabled: bool = True                    # Enable text-driven token pruning
+    qk_layer: int = 0                                # Layer used to retrieve text->vision relevance
+    qk_keep_ratio: float = 0.5                      # Ratio of visual tokens to retain when pruning
+    qk_keep_split: Optional[str] = "0.4,0.6"         # Optional per-view keep weights, e.g. "0.4,0.6"
+    qk_debug: bool = False                           # Verbose QK pruning logging
+    qk_log_topk: int = 16                            # Debug top-k for QK pruning
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -119,6 +134,7 @@ class GenerateConfig:
     #################################################################################################################
     # Utils
     #################################################################################################################
+    run_output_dir: Optional[str] = "./rollouts/adp-10"             # Unified output directory for eval log + rollout videos
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
 
@@ -127,6 +143,33 @@ class GenerateConfig:
     wandb_project: str = "your-wandb-project"        # Name of WandB project
 
     seed: int = 7                                    # Random Seed (for reproducibility)
+    use_dynamic_visual_strategy: bool = True        # Enable action-aware switching between pruned/full vision
+    decision_method: str = "adjacent"                # "avg" or "adjacent"
+    cold_start_windows: int = 2                      # Number of initial windows forced to full vision
+    adjacent_variant: str = "extrema"                # Reserved for compatibility with VLA-ADP configs
+    adjacent_extrema_window: int = 3                 # Threshold window size for adjacent-extrema controller
+    adjacent_lookback: int = 2                       # Number of previous windows used for adjacent thresholds
+    adjacent_last_state: bool = True                 # Keep current state when current delta falls between thresholds
+    initial_state: int = 0                           # Initial dynamic state after cold start: 0=full, 1=pruned
+    delta_method: str = "net"                        # Motion metric: "net", "sum", or rotation-aware variants
+    L_eff: float = 0.15                              # Rotation-to-translation scaling when using rotation-aware delta
+    min_delta_pos: float = 0.0                       # Ignore very small translation deltas in controller
+    min_delta_rot: float = 0.0                       # Ignore very small rotation deltas in controller
+    hysteresis_up: float = 0.0                       # Margin for switching into pruned mode
+    hysteresis_down: float = 0.0                     # Margin for switching into full-vision mode
+    tol_equal: float = 0.0                           # Equality tolerance for threshold comparisons
+    limit_consecutive_pruned_enabled: bool = True    # Force periodic full-vision refresh after repeated pruning
+    limit_max_consecutive_pruned: int = 3            # Max consecutive pruned windows before forcing full vision
+    adp_debug: bool = False                          # Log per-window controller state
+    visualize_pruning: bool = True                  # Save LeRobot-style pruning heatmap overlay in rollout videos
+    overlay_mode: str = "heatmap"                    # "heatmap" | "heatmap_plain" | "heatmap_kept_only"
+    overlay_alpha: float = 0.5                       # Heatmap overlay alpha
+    overlay_heatmap_threshold: float = 0.0           # Hide low-score heatmap cells below this threshold
+    overlay_prune_darken: float = 0.5                # Darkening factor for pruned cells
+    overlay_pruned_color: Optional[str] = "0,0,255"  # RGB tint applied to pruned cells
+    overlay_pruned_alpha: int = 120                  # Alpha for the pruned-cell tint, in [0, 255]
+    overlay_prune_stripe_gap: int = 4                # Stripe spacing for pruned-cell diagonal hatching
+    video_fps: int = 10                              # Rollout visualization FPS
 
     # fmt: on
 
@@ -142,6 +185,11 @@ def validate_config(cfg: GenerateConfig) -> None:
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+    assert 0.0 < cfg.qk_keep_ratio <= 1.0, "qk_keep_ratio must be in (0, 1]!"
+    assert cfg.limit_max_consecutive_pruned >= 1, "limit_max_consecutive_pruned must be >= 1!"
+    assert cfg.overlay_mode in {"heatmap", "heatmap_plain", "heatmap_kept_only"}, "Invalid overlay_mode!"
+    assert 0 <= cfg.overlay_pruned_alpha <= 255, "overlay_pruned_alpha must be in [0, 255]!"
+    assert cfg.video_fps >= 1, "video_fps must be >= 1!"
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -200,9 +248,11 @@ def setup_logging(cfg: GenerateConfig):
     if cfg.run_id_note is not None:
         run_id += f"--{cfg.run_id_note}"
 
-    # Set up local logging
-    os.makedirs(cfg.local_log_dir, exist_ok=True)
-    local_log_filepath = os.path.join(cfg.local_log_dir, run_id + ".txt")
+    # Set up local logging and artifact directory
+    artifact_dir = cfg.run_output_dir if cfg.run_output_dir is not None else cfg.local_log_dir
+    os.makedirs(artifact_dir, exist_ok=True)
+    local_log_filepath = os.path.join(artifact_dir, run_id + ".txt")
+    cfg._resolved_output_dir = artifact_dir
     log_file = open(local_log_filepath, "w")
     logger.info(f"Logging to local log file: {local_log_filepath}")
 
@@ -310,6 +360,9 @@ def run_episode(
     t = 0
     replay_images = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
+    adp_controller = ActionAwarePruningController(cfg) if cfg.use_dynamic_visual_strategy else None
+    current_window_actions = []
+    current_overlay_state = None
 
     # Run episode
     success = False
@@ -323,10 +376,15 @@ def run_episode(
 
             # Prepare observation
             observation, img = prepare_observation(obs, resize_size)
-            replay_images.append(img)
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
+                if adp_controller is not None:
+                    cfg.qk_keep_enabled = bool(adp_controller.start_window())
+                    if cfg.adp_debug:
+                        mode = "pruned" if cfg.qk_keep_enabled else "full"
+                        log_message(f"[ADP] window={adp_controller.window_index} mode={mode}", log_file)
+
                 # Query model to get action
                 actions = get_action(
                     cfg,
@@ -340,6 +398,11 @@ def run_episode(
                     use_film=cfg.use_film,
                 )
                 action_queue.extend(actions)
+                current_window_actions = [np.array(action, copy=True) for action in list(action_queue)]
+                current_overlay_state = get_adp_overlay_state(model) if cfg.visualize_pruning else None
+
+            replay_frame = render_adp_overlay(img, current_overlay_state, cfg)
+            replay_images.append(replay_frame)
 
             # Get action from queue
             action = action_queue.popleft()
@@ -353,6 +416,20 @@ def run_episode(
                 success = True
                 break
             t += 1
+
+            if adp_controller is not None and len(action_queue) == 0 and current_window_actions:
+                adp_summary = adp_controller.finish_window(current_window_actions)
+                if cfg.adp_debug:
+                    next_mode = "pruned" if int(adp_summary["next_state"]) == 1 else "full"
+                    refresh = bool(adp_summary["forced_refresh"])
+                    log_message(
+                        "[ADP] "
+                        f"delta={adp_summary['delta']:.6f} "
+                        f"next_mode={next_mode} "
+                        f"forced_refresh={refresh}",
+                        log_file,
+                    )
+                current_window_actions = []
 
     except Exception as e:
         log_message(f"Episode error: {e}", log_file)
@@ -432,7 +509,13 @@ def run_task(
 
         # Save replay video
         save_rollout_video(
-            replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file
+            replay_images,
+            total_episodes,
+            success=success,
+            task_description=task_description,
+            log_file=log_file,
+            output_dir=getattr(cfg, "_resolved_output_dir", None),
+            fps=cfg.video_fps,
         )
 
         # Log results
@@ -462,6 +545,8 @@ def run_task(
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> float:
     """Main function to evaluate a trained policy on LIBERO benchmark tasks."""
+    load_adp_config_from_json(cfg)
+
     # Validate configuration
     validate_config(cfg)
 
@@ -483,6 +568,22 @@ def eval_libero(cfg: GenerateConfig) -> float:
     num_tasks = task_suite.n_tasks
 
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
+    log_message(
+        "ADP config: "
+        f"dynamic={cfg.use_dynamic_visual_strategy}, "
+        f"qk_keep_enabled={cfg.qk_keep_enabled}, "
+        f"qk_layer={cfg.qk_layer}, "
+        f"qk_keep_ratio={cfg.qk_keep_ratio}, "
+        f"qk_keep_split={cfg.qk_keep_split}, "
+        f"cold_start_windows={cfg.cold_start_windows}, "
+        f"decision_method={cfg.decision_method}, "
+        f"adjacent_variant={cfg.adjacent_variant}, "
+        f"adjacent_extrema_window={cfg.adjacent_extrema_window}, "
+        f"adjacent_lookback={cfg.adjacent_lookback}, "
+        f"delta_method={cfg.delta_method}, "
+        f"limit_max_consecutive_pruned={cfg.limit_max_consecutive_pruned}",
+        log_file,
+    )
 
     # Start evaluation
     total_episodes, total_successes = 0, 0

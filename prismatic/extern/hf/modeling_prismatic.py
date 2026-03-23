@@ -723,6 +723,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
     def __init__(self, config: OpenVLAConfig) -> None:
         super().__init__(config)
         self.norm_stats = config.norm_stats
+        self._adp_visualization_state = None
 
         # Compute action bins
         self.bins = np.linspace(-1, 1, config.n_action_bins)
@@ -789,6 +790,61 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         return actions
+
+    @staticmethod
+    def _compute_qk_importance_generic(
+        language_model: PreTrainedModel,
+        language_embeddings: torch.Tensor,
+        vision_embeddings: torch.Tensor,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """Estimate vision-token importance from text->vision QK similarity at a target layer."""
+        is_gpt2 = hasattr(language_model, "transformer") and hasattr(language_model.transformer, "h")
+        if is_gpt2:
+            layer = language_model.transformer.h[layer_idx]
+            hidden_text = layer.ln_1(language_embeddings) if hasattr(layer, "ln_1") else language_embeddings
+            hidden_vision = layer.ln_1(vision_embeddings) if hasattr(layer, "ln_1") else vision_embeddings
+
+            qkv_text = layer.attn.c_attn(hidden_text)
+            qkv_vision = layer.attn.c_attn(hidden_vision)
+            hidden_size = qkv_text.shape[-1] // 3
+            q_text = qkv_text[..., :hidden_size]
+            k_vis = qkv_vision[..., hidden_size : 2 * hidden_size]
+
+            n_head = language_model.config.n_head
+            head_dim = language_model.config.n_embd // n_head
+        else:
+            layer = language_model.model.layers[layer_idx]
+            hidden_text = (
+                layer.input_layernorm(language_embeddings)
+                if hasattr(layer, "input_layernorm")
+                else language_embeddings
+            )
+            hidden_vision = (
+                layer.input_layernorm(vision_embeddings)
+                if hasattr(layer, "input_layernorm")
+                else vision_embeddings
+            )
+
+            attn = layer.self_attn
+            q_text = torch.nn.functional.linear(hidden_text, attn.q_proj.weight, getattr(attn.q_proj, "bias", None))
+            k_vis = torch.nn.functional.linear(hidden_vision, attn.k_proj.weight, getattr(attn.k_proj, "bias", None))
+
+            n_head = language_model.config.num_attention_heads
+            head_dim = language_model.config.hidden_size // n_head
+
+        def split_heads(x: torch.Tensor) -> torch.Tensor:
+            batch_size, seq_len, hidden_size = x.shape
+            x = x.view(batch_size, seq_len, n_head, head_dim)
+            return x.permute(0, 2, 1, 3).contiguous()
+
+        q = split_heads(q_text)
+        k = split_heads(k_vis)
+
+        scale = 1.0 / (head_dim**0.5)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        importance = scores.mean(dim=(0, 1, 2))
+        return importance.detach().cpu()
 
     def _run_diffusion_prediction(
         self,
@@ -1002,6 +1058,146 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Process vision features
         projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
 
+        qk_keep_config = kwargs.get("qk_keep_config", None)
+        self._adp_visualization_state = None
+        if qk_keep_config and (
+            bool(qk_keep_config.get("qk_keep_enabled", False)) or bool(qk_keep_config.get("qk_visualize", False))
+        ):
+            try:
+                qk_keep_enabled = bool(qk_keep_config.get("qk_keep_enabled", False))
+                qk_visualize = bool(qk_keep_config.get("qk_visualize", False))
+                qk_layer = int(qk_keep_config.get("qk_layer", 0))
+                qk_keep_ratio = float(qk_keep_config.get("qk_keep_ratio", 0.75))
+                qk_keep_split = qk_keep_config.get("qk_keep_split", None)
+
+                _, num_visual_tokens, _ = projected_patch_embeddings.shape
+                per_image_patches = int(self.vision_backbone.get_num_patches())
+                num_images = int(self.vision_backbone.get_num_images_in_input())
+
+                if num_visual_tokens > 0:
+                    if qk_layer > 0:
+                        probe_input_embeddings = input_embeddings * ~all_actions_mask.unsqueeze(-1)
+                        probe_multimodal_embeddings, probe_multimodal_attention_mask = self._build_multimodal_attention(
+                            probe_input_embeddings, projected_patch_embeddings, attention_mask
+                        )
+                        with torch.no_grad():
+                            probe_out = self.language_model(
+                                input_ids=None,
+                                attention_mask=probe_multimodal_attention_mask,
+                                position_ids=None,
+                                past_key_values=None,
+                                inputs_embeds=probe_multimodal_embeddings,
+                                labels=None,
+                                output_hidden_states=True,
+                                use_cache=False,
+                            )
+                        seq_hidden_states = probe_out.hidden_states[qk_layer]
+                        full_visual_tokens = projected_patch_embeddings.shape[1]
+                        bos_hidden = seq_hidden_states[:, :1, :]
+                        vision_hidden = seq_hidden_states[:, 1 : 1 + full_visual_tokens, :]
+                        tail_hidden = seq_hidden_states[:, 1 + full_visual_tokens :, :]
+                        tail_mask = (~all_actions_mask[:, 1:]).unsqueeze(-1).expand_as(tail_hidden)
+                        tail_kept = tail_hidden[tail_mask].reshape(
+                            bos_hidden.shape[0], -1, bos_hidden.shape[-1]
+                        )
+                        text_embeddings = torch.cat([bos_hidden, tail_kept], dim=1)
+                        vision_embeddings = vision_hidden
+                    else:
+                        text_embeddings = language_embeddings
+                        vision_embeddings = projected_patch_embeddings
+
+                    importance = self._compute_qk_importance_generic(
+                        self.language_model, text_embeddings, vision_embeddings, qk_layer
+                    )
+                    keep_mask = torch.ones(num_visual_tokens, dtype=torch.bool)
+                    keep_total = max(1, int(round(num_visual_tokens * qk_keep_ratio)))
+
+                    if qk_keep_enabled and qk_keep_ratio < 1.0:
+                        if num_images > 1 and per_image_patches * num_images == num_visual_tokens:
+                            weights = qk_keep_split if isinstance(qk_keep_split, list) else None
+                            if weights and len(weights) == 2 and num_images > 2:
+                                main_weight, wrist_weight = weights
+                                weights = [main_weight] + [wrist_weight / (num_images - 1)] * (num_images - 1)
+                            if not weights or len(weights) != num_images:
+                                weights = [1.0] * num_images
+
+                            total_weight = sum(max(0.0, float(weight)) for weight in weights)
+                            if total_weight <= 0:
+                                weights = [1.0] * num_images
+                                total_weight = float(num_images)
+
+                            normalized_weights = [float(weight) / total_weight for weight in weights]
+                            per_image_keep = [max(1, int(round(keep_total * weight))) for weight in normalized_weights]
+
+                            diff = keep_total - sum(per_image_keep)
+                            order = sorted(range(num_images), key=lambda idx: normalized_weights[idx], reverse=True)
+                            order_idx = 0
+                            while diff != 0 and order:
+                                image_idx = order[order_idx]
+                                if diff > 0:
+                                    per_image_keep[image_idx] += 1
+                                    diff -= 1
+                                elif per_image_keep[image_idx] > 1:
+                                    per_image_keep[image_idx] -= 1
+                                    diff += 1
+                                order_idx = (order_idx + 1) % len(order)
+
+                            kept_indices = []
+                            for image_idx in range(num_images):
+                                start = image_idx * per_image_patches
+                                end = start + per_image_patches
+                                topk = min(per_image_keep[image_idx], per_image_patches)
+                                _, patch_indices = torch.topk(
+                                    importance[start:end], k=topk, largest=True, sorted=False
+                                )
+                                kept_indices.append((patch_indices + start).to(projected_patch_embeddings.device))
+                            keep_idx = torch.sort(torch.cat(kept_indices, dim=0).long())[0]
+                        else:
+                            _, keep_idx = torch.topk(importance, k=keep_total, largest=True, sorted=True)
+                            keep_idx = keep_idx.to(projected_patch_embeddings.device).long()
+
+                        keep_mask = torch.zeros(num_visual_tokens, dtype=torch.bool)
+                        keep_mask[keep_idx.detach().cpu()] = True
+                        projected_patch_embeddings = projected_patch_embeddings.index_select(dim=1, index=keep_idx)
+
+                    if qk_visualize:
+                        heatmap_grids = []
+                        heatmap_mask_grids = []
+                        if per_image_patches > 0 and per_image_patches * max(num_images, 1) == num_visual_tokens:
+                            patches_side = int(round(per_image_patches**0.5))
+                            square_grid = patches_side * patches_side == per_image_patches
+                            for image_idx in range(max(num_images, 1)):
+                                start = image_idx * per_image_patches
+                                end = start + per_image_patches
+                                importance_i = importance[start:end].numpy().astype(np.float32)
+                                keep_i = keep_mask[start:end].numpy().astype(np.uint8)
+                                if importance_i.size == 0:
+                                    continue
+                                imp_min = float(importance_i.min())
+                                imp_max = float(importance_i.max())
+                                if imp_max > imp_min:
+                                    importance_i = (importance_i - imp_min) / (imp_max - imp_min)
+                                else:
+                                    importance_i = np.zeros_like(importance_i)
+                                if square_grid:
+                                    heatmap_grids.append(importance_i.reshape(patches_side, patches_side))
+                                    heatmap_mask_grids.append(keep_i.reshape(patches_side, patches_side))
+                                else:
+                                    heatmap_grids.append(importance_i.reshape(1, -1))
+                                    heatmap_mask_grids.append(keep_i.reshape(1, -1))
+                        self._adp_visualization_state = {
+                            "last_heatmap_grids": heatmap_grids,
+                            "last_heatmap_mask_grids": heatmap_mask_grids if heatmap_mask_grids else None,
+                            "last_heatmap_mask_mode": (
+                                "pruned" if qk_keep_enabled and qk_keep_ratio < 1.0 else None
+                            ),
+                        }
+            except Exception as exc:
+                self._adp_visualization_state = None
+                logger.warning("Failed to apply ADP token pruning at layer %s: %s", qk_keep_config.get("qk_layer"), exc)
+
+        num_visual_patches = int(projected_patch_embeddings.shape[1])
+
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
         if use_proprio:
@@ -1013,12 +1209,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Use diffusion if provided, otherwise use regression or discrete prediction
         use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")
 
-        # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
-        NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
-        if use_proprio:
-            NUM_PATCHES += 1
-        if use_diffusion:
-            NUM_PATCHES += 1
+        # Index action hidden states using the actual multimodal prefix length after optional pruning.
+        NUM_PATCHES = num_visual_patches + (1 if use_proprio else 0) + (1 if use_diffusion else 0)
 
         if use_diffusion:
             # Sample random noise with shape equal to output action, used as the starting state for reverse diffusion
@@ -1083,3 +1275,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         """Get all the logged statistics for the given dataset."""
         unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
         return self.norm_stats[unnorm_key]["action"]
+
+    def get_adp_visualization_state(self) -> Optional[Dict[str, Any]]:
+        """Return the most recent ADP visualization payload."""
+        return self._adp_visualization_state
