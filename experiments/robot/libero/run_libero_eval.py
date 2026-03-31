@@ -8,14 +8,16 @@ import json
 import logging
 import os
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, List, Optional, Union
 
 import draccus
 import numpy as np
+import torch
 import tqdm
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../../LIBERO'))
 from libero.libero import benchmark
@@ -138,6 +140,13 @@ class GenerateConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
 
+    run_cuda_latency_benchmark: bool = False         # Measure CUDA-synchronized model latency on a representative LIBERO observation
+    cuda_latency_only: bool = False                  # Exit after latency benchmark instead of running the full evaluation
+    cuda_latency_warmup_steps: int = 10              # Warmup iterations before timing
+    cuda_latency_num_iters: int = 50                 # Number of timed iterations for latency benchmark
+    cuda_latency_task_id: int = 0                    # Task index used to build latency benchmark inputs
+    cuda_latency_episode_idx: int = 0                # Episode index / initial state used to build latency benchmark inputs
+
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
     wandb_project: str = "your-wandb-project"        # Name of WandB project
@@ -190,6 +199,13 @@ def validate_config(cfg: GenerateConfig) -> None:
     assert cfg.overlay_mode in {"heatmap", "heatmap_plain", "heatmap_kept_only"}, "Invalid overlay_mode!"
     assert 0 <= cfg.overlay_pruned_alpha <= 255, "overlay_pruned_alpha must be in [0, 255]!"
     assert cfg.video_fps >= 1, "video_fps must be >= 1!"
+    assert cfg.cuda_latency_warmup_steps >= 0, "cuda_latency_warmup_steps must be >= 0!"
+    assert cfg.cuda_latency_num_iters >= 1, "cuda_latency_num_iters must be >= 1!"
+    assert cfg.cuda_latency_task_id >= 0, "cuda_latency_task_id must be >= 0!"
+    assert cfg.cuda_latency_episode_idx >= 0, "cuda_latency_episode_idx must be >= 0!"
+    assert not (cfg.cuda_latency_only and not cfg.run_cuda_latency_benchmark), (
+        "cuda_latency_only requires run_cuda_latency_benchmark=True!"
+    )
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -324,6 +340,289 @@ def process_action(action, model_family):
         action = invert_gripper_action(action)
 
     return action
+
+
+def clone_observation(observation: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Clone observation arrays because get_action mutates proprio in-place."""
+    return {
+        key: np.array(value, copy=True) if isinstance(value, np.ndarray) else value
+        for key, value in observation.items()
+    }
+
+
+def summarize_latency_ms(latencies_ms: List[float]) -> Dict[str, float]:
+    """Compute aggregate latency statistics in milliseconds."""
+    latencies = np.asarray(latencies_ms, dtype=np.float64)
+    return {
+        "count": int(latencies.size),
+        "mean_ms": float(latencies.mean()),
+        "std_ms": float(latencies.std()),
+        "min_ms": float(latencies.min()),
+        "p50_ms": float(np.percentile(latencies, 50)),
+        "p90_ms": float(np.percentile(latencies, 90)),
+        "p95_ms": float(np.percentile(latencies, 95)),
+        "max_ms": float(latencies.max()),
+    }
+
+
+def resolve_episode_initial_state(
+    cfg: GenerateConfig,
+    task_description: str,
+    initial_states,
+    all_initial_states,
+    episode_idx: int,
+):
+    """Resolve a specific episode's initial state for both default and custom state files."""
+    if cfg.initial_states_path == "DEFAULT":
+        if episode_idx >= len(initial_states):
+            raise IndexError(
+                f"cuda_latency_episode_idx={episode_idx} is out of range for task "
+                f"'{task_description}' (available={len(initial_states)})"
+            )
+        return initial_states[episode_idx]
+
+    initial_states_task_key = task_description.replace(" ", "_")
+    episode_key = f"demo_{episode_idx}"
+    if initial_states_task_key not in all_initial_states:
+        raise KeyError(f"Task key '{initial_states_task_key}' not found in {cfg.initial_states_path}")
+    if episode_key not in all_initial_states[initial_states_task_key]:
+        raise KeyError(f"Episode key '{episode_key}' not found for task '{task_description}'")
+    if not all_initial_states[initial_states_task_key][episode_key]["success"]:
+        raise ValueError(
+            f"Custom initial state for task '{task_description}' episode {episode_idx} is marked unsuccessful"
+        )
+    return np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
+
+
+def prepare_latency_benchmark_inputs(
+    cfg: GenerateConfig,
+    task_suite,
+    task_id: int,
+    episode_idx: int,
+    resize_size,
+    log_file=None,
+):
+    """Create one representative observation for the latency benchmark."""
+    if task_id >= task_suite.n_tasks:
+        raise IndexError(
+            f"cuda_latency_task_id={task_id} is out of range for task suite {cfg.task_suite_name} "
+            f"(num_tasks={task_suite.n_tasks})"
+        )
+
+    task = task_suite.get_task(task_id)
+    initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)
+    env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
+
+    try:
+        env.reset()
+        initial_state = resolve_episode_initial_state(
+            cfg,
+            task_description,
+            initial_states,
+            all_initial_states,
+            episode_idx,
+        )
+        obs = env.set_init_state(initial_state)
+
+        for _ in range(cfg.num_steps_wait):
+            obs, _, _, _ = env.step(get_libero_dummy_action(cfg.model_family))
+
+        observation, _ = prepare_observation(obs, resize_size)
+        return observation, task_description
+    finally:
+        close_fn = getattr(env, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+
+def benchmark_action_latency(
+    cfg: GenerateConfig,
+    model,
+    observation: Dict[str, np.ndarray],
+    task_description: str,
+    processor=None,
+    action_head=None,
+    proprio_projector=None,
+    noisy_action_projector=None,
+    qk_keep_enabled: bool = False,
+):
+    """Benchmark end-to-end wall time and CUDA device time for action generation."""
+    wall_latencies_ms: List[float] = []
+    cuda_latencies_ms: List[float] = []
+    use_cuda_events = torch.cuda.is_available()
+    original_qk_keep_enabled = cfg.qk_keep_enabled
+    original_visualize_pruning = cfg.visualize_pruning
+
+    cfg.qk_keep_enabled = bool(qk_keep_enabled)
+    cfg.visualize_pruning = False
+
+    try:
+        for _ in range(cfg.cuda_latency_warmup_steps):
+            _ = get_action(
+                cfg,
+                model,
+                clone_observation(observation),
+                task_description,
+                processor=processor,
+                action_head=action_head,
+                proprio_projector=proprio_projector,
+                noisy_action_projector=noisy_action_projector,
+                use_film=cfg.use_film,
+            )
+
+        if use_cuda_events:
+            torch.cuda.synchronize()
+
+        for _ in range(cfg.cuda_latency_num_iters):
+            timed_observation = clone_observation(observation)
+            start_event = torch.cuda.Event(enable_timing=True) if use_cuda_events else None
+            end_event = torch.cuda.Event(enable_timing=True) if use_cuda_events else None
+
+            if use_cuda_events:
+                torch.cuda.synchronize()
+
+            wall_start_time = time.perf_counter()
+            if start_event is not None:
+                start_event.record()
+
+            _ = get_action(
+                cfg,
+                model,
+                timed_observation,
+                task_description,
+                processor=processor,
+                action_head=action_head,
+                proprio_projector=proprio_projector,
+                noisy_action_projector=noisy_action_projector,
+                use_film=cfg.use_film,
+            )
+
+            if end_event is not None:
+                end_event.record()
+                torch.cuda.synchronize()
+
+            wall_end_time = time.perf_counter()
+            wall_latencies_ms.append((wall_end_time - wall_start_time) * 1000.0)
+
+            if start_event is not None and end_event is not None:
+                cuda_latencies_ms.append(float(start_event.elapsed_time(end_event)))
+    finally:
+        cfg.qk_keep_enabled = original_qk_keep_enabled
+        cfg.visualize_pruning = original_visualize_pruning
+
+    return wall_latencies_ms, cuda_latencies_ms
+
+
+def log_latency_summary(mode_name: str, wall_latencies_ms: List[float], cuda_latencies_ms: List[float], log_file=None):
+    """Log latency summary for one benchmark mode."""
+    wall_summary = summarize_latency_ms(wall_latencies_ms)
+    wall_message = (
+        f"[CUDA latency][{mode_name}] "
+        f"wall_ms mean={wall_summary['mean_ms']:.2f} "
+        f"std={wall_summary['std_ms']:.2f} "
+        f"p50={wall_summary['p50_ms']:.2f} "
+        f"p90={wall_summary['p90_ms']:.2f} "
+        f"p95={wall_summary['p95_ms']:.2f} "
+        f"min={wall_summary['min_ms']:.2f} "
+        f"max={wall_summary['max_ms']:.2f} "
+        f"n={wall_summary['count']}"
+    )
+    log_message(wall_message, log_file)
+
+    if cuda_latencies_ms:
+        cuda_summary = summarize_latency_ms(cuda_latencies_ms)
+        cuda_message = (
+            f"[CUDA latency][{mode_name}] "
+            f"cuda_ms mean={cuda_summary['mean_ms']:.2f} "
+            f"std={cuda_summary['std_ms']:.2f} "
+            f"p50={cuda_summary['p50_ms']:.2f} "
+            f"p90={cuda_summary['p90_ms']:.2f} "
+            f"p95={cuda_summary['p95_ms']:.2f} "
+            f"min={cuda_summary['min_ms']:.2f} "
+            f"max={cuda_summary['max_ms']:.2f} "
+            f"n={cuda_summary['count']}"
+        )
+        log_message(cuda_message, log_file)
+
+    return wall_summary, summarize_latency_ms(cuda_latencies_ms) if cuda_latencies_ms else None
+
+
+def run_cuda_latency_benchmark(
+    cfg: GenerateConfig,
+    task_suite,
+    model,
+    resize_size,
+    processor=None,
+    action_head=None,
+    proprio_projector=None,
+    noisy_action_projector=None,
+    log_file=None,
+):
+    """Run CUDA latency benchmark on a representative LIBERO observation."""
+    observation, task_description = prepare_latency_benchmark_inputs(
+        cfg,
+        task_suite,
+        cfg.cuda_latency_task_id,
+        cfg.cuda_latency_episode_idx,
+        resize_size,
+        log_file,
+    )
+
+    log_message(
+        "[CUDA latency] "
+        f"task_id={cfg.cuda_latency_task_id} "
+        f"episode_idx={cfg.cuda_latency_episode_idx} "
+        f"warmup={cfg.cuda_latency_warmup_steps} "
+        f"iters={cfg.cuda_latency_num_iters} "
+        f"task=\"{task_description}\"",
+        log_file,
+    )
+    if not torch.cuda.is_available():
+        log_message("[CUDA latency] CUDA is not available; only wall-clock latency will be reported.", log_file)
+
+    benchmark_modes = [("full", False)]
+    if cfg.qk_keep_ratio < 1.0:
+        benchmark_modes.append(("pruned", True))
+
+    summaries = {}
+    for mode_name, qk_keep_enabled in benchmark_modes:
+        wall_latencies_ms, cuda_latencies_ms = benchmark_action_latency(
+            cfg,
+            model,
+            observation,
+            task_description,
+            processor=processor,
+            action_head=action_head,
+            proprio_projector=proprio_projector,
+            noisy_action_projector=noisy_action_projector,
+            qk_keep_enabled=qk_keep_enabled,
+        )
+        wall_summary, cuda_summary = log_latency_summary(
+            mode_name,
+            wall_latencies_ms,
+            cuda_latencies_ms,
+            log_file,
+        )
+        summaries[mode_name] = {
+            "wall": wall_summary,
+            "cuda": cuda_summary,
+        }
+
+    if cfg.use_wandb:
+        wandb_payload = {}
+        for mode_name, summary_dict in summaries.items():
+            for metric_name, metric_value in summary_dict["wall"].items():
+                wandb_payload[f"latency/{mode_name}/wall/{metric_name}"] = metric_value
+            if summary_dict["cuda"] is not None:
+                for metric_name, metric_value in summary_dict["cuda"].items():
+                    wandb_payload[f"latency/{mode_name}/cuda/{metric_name}"] = metric_value
+        if wandb_payload:
+            wandb.log(wandb_payload)
+
+    return summaries
 
 
 def run_episode(
@@ -468,8 +767,13 @@ def run_task(
 
         # Handle initial state
         if cfg.initial_states_path == "DEFAULT":
-            # Use default initial state
-            initial_state = initial_states[episode_idx]
+            initial_state = resolve_episode_initial_state(
+                cfg,
+                task_description,
+                initial_states,
+                all_initial_states,
+                episode_idx,
+            )
         else:
             # Get keys for fetching initial episode state from JSON
             initial_states_task_key = task_description.replace(" ", "_")
@@ -480,8 +784,13 @@ def run_task(
                 log_message(f"Skipping task {task_id} episode {episode_idx} due to failed expert demo!", log_file)
                 continue
 
-            # Get initial state
-            initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
+            initial_state = resolve_episode_initial_state(
+                cfg,
+                task_description,
+                initial_states,
+                all_initial_states,
+                episode_idx,
+            )
 
         log_message(f"Starting episode {task_episodes + 1}...", log_file)
 
@@ -584,6 +893,28 @@ def eval_libero(cfg: GenerateConfig) -> float:
         f"limit_max_consecutive_pruned={cfg.limit_max_consecutive_pruned}",
         log_file,
     )
+
+    latency_summaries = None
+    if cfg.run_cuda_latency_benchmark:
+        latency_summaries = run_cuda_latency_benchmark(
+            cfg,
+            task_suite,
+            model,
+            resize_size,
+            processor,
+            action_head,
+            proprio_projector,
+            noisy_action_projector,
+            log_file,
+        )
+        if cfg.cuda_latency_only:
+            benchmark_summary = latency_summaries["full"]["cuda"] or latency_summaries["full"]["wall"]
+            benchmark_value = float(benchmark_summary["mean_ms"])
+            if cfg.use_wandb:
+                wandb.save(local_log_filepath)
+            if log_file:
+                log_file.close()
+            return benchmark_value
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
